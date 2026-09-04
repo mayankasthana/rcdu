@@ -1,0 +1,18 @@
+[package]
+name = "rcdu"
+version = "0.1.0"
+edition = "2021"
+description = "An ncdu-like disk usage explorer that is interactive while it scans, optimized for SSDs"
+license = "MIT"
+
+[dependencies]
+ratatui = "0.29"
+crossbeam-channel = "0.5"
+serde_json = "1"
+compact_str = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
