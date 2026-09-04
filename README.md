@@ -124,6 +124,10 @@ Build all three with the bundled script:
 ./build-portable.sh        # outputs dist/rcdu-{linux-x86_64,linux-aarch64,macos-<arch>}
 ```
 
+Prebuilt binaries for every release (Linux x86_64/ARM64 static musl, macOS
+Apple Silicon/Intel, plus SHA-256 checksums) are attached to the
+[GitHub Releases](https://github.com/mayankasthana/rcdu/releases) page.
+
 The Linux targets are cross-compiled straight from macOS using the toolchain's bundled
 `rust-lld` — **no Docker, no zig, no external linker required**.
 

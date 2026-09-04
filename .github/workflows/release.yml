@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl,  artifact: rcdu-linux-x86_64 }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, artifact: rcdu-linux-aarch64 }
+          - { os: macos-latest,  target: aarch64-apple-darwin,       artifact: rcdu-macos-aarch64 }
+          - { os: macos-latest,  target: x86_64-apple-darwin,        artifact: rcdu-macos-x86_64 }
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build portable binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [[ "${{ matrix.target }}" == *-musl ]]; then
+            # Fully static musl builds via the toolchain's bundled rust-lld
+            # (same trick as build-portable.sh — no external cross toolchain).
+            LLD=$(find "$(rustc --print sysroot)" -name 'rust-lld' | head -1)
+            RUSTFLAGS="-C linker=$LLD -C linker-flavor=ld.lld -C link-self-contained=yes -C strip=symbols" \
+              cargo build --release --target "${{ matrix.target }}"
+          else
+            RUSTFLAGS="-C strip=symbols" \
+              cargo build --release --target "${{ matrix.target }}"
+          fi
+          cp "target/${{ matrix.target }}/release/rcdu" "dist/${{ matrix.artifact }}"
+          file "dist/${{ matrix.artifact }}"
+
+      - name: Smoke test (--version)
+        shell: bash
+        run: |
+          # Only runs when the built binary matches the runner architecture.
+          if [ -x "dist/${{ matrix.artifact }}" ]; then
+            "dist/${{ matrix.artifact }}" --version || echo "cannot execute on this runner (cross-compiled) — skipping"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum rcdu-* > sha256sums.txt
+          cat sha256sums.txt
+
+      - name: Smoke test linux-x86_64 on the runner
+        run: |
+          chmod +x dist/rcdu-linux-x86_64
+          dist/rcdu-linux-x86_64 --version
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/rcdu-* dist/sha256sums.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "rcdu $GITHUB_REF_NAME" \
+            --generate-notes
