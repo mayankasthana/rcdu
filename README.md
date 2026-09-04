@@ -36,6 +36,10 @@ SHA-256 checksum, and installs it to `~/.local/bin`. Override the destination wi
 `RCDU_INSTALL_DIR=...` or pin a version with `RCDU_VERSION=v0.1.0`. From source with a Rust
 toolchain instead: `cargo install --git https://github.com/mayankasthana/rcdu`.
 
+Already installed? `rcdu update` upgrades in place: it checks GitHub Releases, verifies the
+SHA-256 checksum, and atomically replaces the binary (downloads run through `curl`, the same
+tool the install script uses). `rcdu update --check` only reports whether a newer release exists.
+
 ## Usage
 
 ```
@@ -171,7 +175,9 @@ RUSTFLAGS="-C linker=$LLD -C linker-flavor=ld.lld -C link-self-contained=yes" \
 | `dump.rs` | ncdu-compatible JSON import/export. |
 | `app.rs` | App state + key handling, modals (help/confirm), deletion. Selection tracks node *identity*, so the highlight doesn't jump as live updates reorder the list. |
 | `ui.rs` | ratatui rendering: size bars, percentages, type indicators, popups. |
-| `main.rs` | Args, modes (scan / import / export), terminal lifecycle, event loop. |
+| `update.rs` | `rcdu update`: self-update from GitHub Releases — fetch latest tag, download the platform asset via `curl`, verify its checksum, atomically replace the binary. |
+| `sha256.rs` | Minimal SHA-256 (FIPS 180-4) so update verification needs no external tools or crates. |
+| `main.rs` | Args, modes (scan / import / export / update), terminal lifecycle, event loop. |
 
 ## Testing
 
@@ -188,7 +194,8 @@ buffered — verifying the concurrency and size-propagation logic.
 Implemented: live/progressive parallel scan, SSD-tuned threading, **navigation-prioritized
 scanning**, sort, apparent/disk toggle, delete (background, with the still-scanning safety gate,
 `-r`, and a guarded Ctrl-C), hard-link dedup, `--exclude` / `-X`, `-x` one-file-system, ncdu JSON
-import/export, help dialog, a memory-lean node representation, and static portable binaries.
+import/export, self-update (`rcdu update`, with checksum verification), help dialog, a
+memory-lean node representation, and static portable binaries.
 
 Possible future work: in-place refresh (`r`) of a subtree, the ncdu "shared/unique" size
 breakdown column, and a file-info panel. Further memory wins are available if needed (`u32`

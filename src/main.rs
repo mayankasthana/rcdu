@@ -5,7 +5,9 @@ mod dump;
 mod glob;
 mod model;
 mod scan;
+mod sha256;
 mod ui;
+mod update;
 
 use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::fs::MetadataExt;
@@ -114,6 +116,7 @@ fn print_help() {
 
 USAGE:
     rcdu [PATH] [OPTIONS]
+    rcdu update [--check]
 
 ARGS:
     PATH                     directory to scan (default: current directory)
@@ -130,6 +133,10 @@ OPTIONS:
     -h, --help               show this help
     -V, --version            show version
 
+COMMANDS:
+    update [--check]         replace the binary with the latest GitHub release
+                             (downloads via curl, verifies SHA-256; --check only reports)
+
 KEYS:
     j/k, down/up    move          l/Enter/right   enter directory
     h/Backspace     go up         s               toggle sort (size/name)
@@ -140,6 +147,14 @@ KEYS:
 }
 
 fn main() {
+    // `rcdu update` is a subcommand, checked before PATH-style parsing.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("update") {
+        let check_only = argv.iter().skip(1).any(|a| a == "--check");
+        let code = update::run(check_only);
+        std::process::exit(code);
+    }
+
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
