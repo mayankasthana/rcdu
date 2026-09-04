@@ -20,6 +20,22 @@ differences that matter:
 It is a **drop-in ncdu replacement**: the common ncdu flags work, and it reads and writes the
 ncdu JSON export format, so existing dumps and scripts keep working.
 
+<p align="center">
+  <img src=".github/assets/screenshot.png" alt="rcdu browsing a scanned directory" width="97%">
+</p>
+
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mayankasthana/rcdu/main/install.sh | sh
+```
+
+The script detects your platform (macOS Apple Silicon/Intel, Linux x86-64/ARM64), downloads the
+static binary from [Releases](https://github.com/mayankasthana/rcdu/releases), verifies its
+SHA-256 checksum, and installs it to `~/.local/bin`. Override the destination with
+`RCDU_INSTALL_DIR=...` or pin a version with `RCDU_VERSION=v0.1.0`. From source with a Rust
+toolchain instead: `cargo install --git https://github.com/mayankasthana/rcdu`.
+
 ## Usage
 
 ```
