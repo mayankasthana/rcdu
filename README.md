@@ -81,6 +81,7 @@ rcdu -f old.json -o new.json    # re-read and rewrite a dump (recomputes totals/
 | `h` / `Backspace` / `←` | go up |
 | `g` / `G` | jump to top / bottom |
 | `s` | toggle sort (size ↔ name) |
+| `/` | filter entries by name (type to filter live, Enter applies, Esc cancels) |
 | `a` | toggle apparent size ↔ on-disk usage |
 | `d` | delete selected entry (asks to confirm) |
 | `o` | open selected entry (default app; directories in the file manager) |
@@ -91,6 +92,15 @@ Row indicators: `/` dir · `@` symlink · `H` hard-link duplicate · `<` exclude
 
 By default sizes are **on-disk usage** (`st_blocks × 512`); press `a` for apparent size.
 Symlinks are never followed (counted as the link itself), matching ncdu's default.
+
+### Filtering
+
+Press `/` and type: the view narrows to entries whose name contains the query
+(case-insensitive), and the selection jumps to the first match. While a filter is applied the
+title shows `N of M items` and the footer echoes the query with match counts, so a filter is
+never silently on. `Enter` applies it (navigation, delete, and open then operate only on the
+matches); `Esc` cancels and restores the previous selection. The filter applies to whichever
+directory you're viewing until cleared.
 
 ### Deleting
 

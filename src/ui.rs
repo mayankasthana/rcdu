@@ -166,6 +166,10 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
         } else {
             " (empty) ".to_string()
         }
+    } else if app.filter.is_some() {
+        // When a filter is active, show how many of the directory's entries match.
+        let total = app.tree.nodes[app.cur].children.len();
+        format!(" {} of {} items ", kids.len(), total)
     } else {
         format!(" {} items ", kids.len())
     };
@@ -191,6 +195,27 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             ))),
             area,
         );
+        return;
+    }
+
+    // While a filter is being typed, the input line replaces the hints.
+    if app.searching {
+        let q = app.filter.as_deref().unwrap_or("");
+        let line = Line::from(vec![
+            Span::styled(
+                " filter ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" /{q}▌")),
+            Span::styled(
+                "  Enter apply · Esc cancel",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
         return;
     }
 
@@ -230,7 +255,14 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         SortKey::Size => "size",
         SortKey::Name => "name",
     };
-    let help = format!(" ? help  d delete  s sort:{sort}  a usage  q quit   │   {status}");
+    let mut help = format!(" ? help  d delete  s sort:{sort}  a usage  q quit");
+    if let Some(q) = &app.filter {
+        // Keep the applied filter visible (with match counts) so it's never silently on.
+        let matches = app.sorted_children().len();
+        let total = app.tree.nodes[app.cur].children.len();
+        help.push_str(&format!("  │  /{q} ({matches}/{total})"));
+    }
+    help.push_str(&format!("   │   {status}"));
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             help,
@@ -276,6 +308,7 @@ fn render_help(f: &mut Frame) {
         Line::from("  h / Backspace / ← go up"),
         Line::from("  g / G             jump to top / bottom"),
         Line::from("  s                 toggle sort (size ↔ name)"),
+        Line::from("  /                 filter entries by name (Enter applies, Esc cancels)"),
         Line::from("  a                 toggle apparent ↔ disk usage"),
         Line::from("  d                 delete selected (confirm; needs full scan)"),
         Line::from("  o                 open selected in default app / file manager"),
