@@ -33,6 +33,12 @@ struct PendingDelete {
     rx: Receiver<std::io::Result<()>>,
 }
 
+/// A system-open running on a background thread, so a slow or hung opener can't freeze the UI.
+struct PendingOpen {
+    path: String,
+    rx: Receiver<std::io::Result<()>>,
+}
+
 pub struct App {
     pub tree: Tree,
     /// Directory currently being viewed.
@@ -51,6 +57,8 @@ pub struct App {
     pub status: Option<String>,
     /// A deletion currently running on a background thread.
     pending_delete: Option<PendingDelete>,
+    /// Opens still running on background threads, oldest first.
+    pending_open: Vec<PendingOpen>,
     /// True once the user has pressed quit during a deletion; a second press force-quits.
     quit_armed: bool,
     /// Handle to steer the live scan (prioritize the focused directory). None when browsing a
@@ -73,6 +81,7 @@ impl App {
             modal: Modal::None,
             status: None,
             pending_delete: None,
+            pending_open: Vec::new(),
             quit_armed: false,
             scan_control: None,
             tick: 0,
@@ -274,9 +283,43 @@ impl App {
             return;
         }
         let path = self.tree.path_of(sel);
-        match open_path(&path) {
-            Ok(()) => self.status = Some(format!("opened {}", path)),
-            Err(e) => self.status = Some(format!("open failed: {e}")),
+        let (tx, rx) = unbounded();
+        let p = path.clone();
+        // Waiting happens off the UI thread: openers normally return at once, but a wedged
+        // handler must not take the TUI down with it. Waiting here still reaps the child.
+        std::thread::spawn(move || {
+            let _ = tx.send(open_path(&p));
+        });
+        self.status = Some(format!("opening {path}"));
+        self.pending_open.push(PendingOpen { path, rx });
+    }
+
+    /// Check whether a background open has finished and surface its result. Called once per
+    /// frame by the event loop.
+    pub fn poll_open(&mut self) {
+        if self.pending_open.is_empty() {
+            return;
+        }
+        let mut finished = Vec::new();
+        self.pending_open.retain_mut(|p| match p.rx.try_recv() {
+            Ok(res) => {
+                finished.push((p.path.clone(), res));
+                false
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => true, // still working
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                finished.push((
+                    p.path.clone(),
+                    Err(std::io::Error::other("open worker exited unexpectedly")),
+                ));
+                false
+            }
+        });
+        for (path, res) in finished {
+            self.status = Some(match res {
+                Ok(()) => format!("opened {path}"),
+                Err(e) => format!("open failed: {e}"),
+            });
         }
     }
 
@@ -367,9 +410,8 @@ impl App {
     }
 }
 
-/// Launch the platform opener for `path` and wait for it to exit — the stock openers hand off
-/// to the OS and return immediately, and waiting reaps the child instead of leaving a zombie.
-/// Stdio is disconnected so the opener can't scribble on the TUI.
+/// Launch the platform opener for `path` and wait for it to exit — waiting reaps the child
+/// instead of leaving a zombie. Stdio is disconnected so the opener can't scribble on the TUI.
 fn open_path(path: &str) -> std::io::Result<()> {
     let status = opener_command(path)
         .stdin(Stdio::null())
@@ -442,4 +484,53 @@ pub enum KeyAction {
     Open,
     Confirm,
     Cancel,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app() -> App {
+        App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, false)
+    }
+
+    /// A finished open lands in the status line and drains its slot, so the UI thread never
+    /// waited on the opener.
+    #[test]
+    fn finished_open_reports_result_and_drains() {
+        let mut a = app();
+        let (tx, rx) = unbounded();
+        tx.send(Err(std::io::Error::other("no handler"))).unwrap();
+        drop(tx);
+        a.pending_open.push(PendingOpen {
+            path: "/r/a".into(),
+            rx,
+        });
+
+        a.poll_open();
+        assert_eq!(a.status.as_deref(), Some("open failed: no handler"));
+        assert!(a.pending_open.is_empty());
+    }
+
+    /// An opener that hasn't exited yet keeps its slot (and reports nothing), then resolves on
+    /// a later frame.
+    #[test]
+    fn in_flight_open_waits_and_then_resolves() {
+        let mut a = app();
+        let (tx, rx) = unbounded();
+        a.pending_open.push(PendingOpen {
+            path: "/r/a".into(),
+            rx,
+        });
+
+        a.poll_open();
+        assert_eq!(a.pending_open.len(), 1);
+        assert_eq!(a.status, None);
+
+        tx.send(Ok(())).unwrap();
+        drop(tx);
+        a.poll_open();
+        assert_eq!(a.status.as_deref(), Some("opened /r/a"));
+        assert!(a.pending_open.is_empty());
+    }
 }

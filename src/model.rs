@@ -15,6 +15,7 @@
 //! `dir_index` map is released once scanning finishes.
 
 use std::collections::HashMap;
+use std::path::MAIN_SEPARATOR;
 
 use compact_str::CompactString;
 
@@ -315,14 +316,10 @@ impl Tree {
         // The root name is already an absolute path; join the rest with separators.
         let mut out = String::new();
         for (i, p) in parts.iter().enumerate() {
-            if i == 0 {
-                out.push_str(p);
-            } else {
-                if !out.ends_with('/') {
-                    out.push('/');
-                }
-                out.push_str(p);
+            if i > 0 && !out.ends_with(MAIN_SEPARATOR) {
+                out.push(MAIN_SEPARATOR);
             }
+            out.push_str(p);
         }
         out
     }

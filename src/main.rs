@@ -11,7 +11,7 @@ mod update;
 
 use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crossbeam_channel::TryRecvError;
@@ -141,7 +141,8 @@ KEYS:
     j/k, down/up    move          l/Enter/right   enter directory
     h/Backspace     go up         s               toggle sort (size/name)
     a               apparent/disk d               delete (confirm; needs full scan)
-    ?               help          g/G             top/bottom        q/Esc   quit",
+    o               open          ?               help
+    g/G             top/bottom    q/Esc           quit",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -233,7 +234,11 @@ fn prepare_scan(args: &Args) -> (Tree, PathBuf, Opts) {
         eprintln!("rcdu: {} is not a directory", root.display());
         std::process::exit(1);
     }
-    let root_name = root.to_string_lossy();
+    // One path form everywhere: the tree's names, the scanner's queued jobs, and what we hand
+    // to the OS all speak the plain (non-verbatim) form, so navigation focus, delete and open
+    // all agree on the same string.
+    let root_name = plain_path(&root);
+    let root = PathBuf::from(&root_name);
     let tree = Tree::new(
         root_name.into(),
         meta.len(),
@@ -248,6 +253,26 @@ fn prepare_scan(args: &Args) -> (Tree, PathBuf, Opts) {
         root_dev: meta.dev(),
     };
     (tree, root, opts)
+}
+
+/// The scan root as a plain, user-visible path. `std::fs::canonicalize` returns a verbatim
+/// `\\?\C:\…` path on Windows, which Win32 path normalization and the OS openers reject, so the
+/// standard verbatim forms are reduced to their plain equivalent. Device paths have no plain
+/// form and stay verbatim.
+fn plain_path(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    let reduced = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        Some(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        let b = rest.as_bytes();
+        let is_drive_path = b.first().is_some_and(u8::is_ascii_alphabetic)
+            && b.get(1) == Some(&b':')
+            && b.get(2) == Some(&b'\\');
+        is_drive_path.then(|| rest.to_string())
+    } else {
+        None
+    };
+    reduced.unwrap_or_else(|| s.into_owned())
 }
 
 fn scan_to_completion(mut tree: Tree, root: PathBuf, opts: Opts) -> Tree {
@@ -329,6 +354,7 @@ fn run(
 
         // Fold in the result of any background deletion.
         app.poll_delete();
+        app.poll_open();
 
         terminal.draw(|f| ui::render(f, app))?;
 
@@ -371,4 +397,27 @@ fn decode_key(code: KeyCode, mods: KeyModifiers) -> Option<KeyAction> {
         KeyCode::Char('?') => KeyAction::Help,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::plain_path;
+
+    #[test]
+    fn verbatim_roots_reduce_to_plain_paths() {
+        assert_eq!(plain_path(Path::new(r"\\?\C:\Users\me")), r"C:\Users\me");
+        assert_eq!(plain_path(Path::new(r"\\?\C:\")), r"C:\");
+        assert_eq!(
+            plain_path(Path::new(r"\\?\UNC\srv\share\dir")),
+            r"\\srv\share\dir"
+        );
+        assert_eq!(plain_path(Path::new("/tmp/x")), "/tmp/x");
+        // Not a drive path: reducing it would turn a device path into a bogus relative one.
+        assert_eq!(
+            plain_path(Path::new(r"\\?\.\PhysicalDrive0")),
+            r"\\?\.\PhysicalDrive0"
+        );
+    }
 }
