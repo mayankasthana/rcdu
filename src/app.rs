@@ -4,6 +4,7 @@
 //! the same entry even as live size updates reshuffle the sort order during a scan.
 
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 
 use crossbeam_channel::{unbounded, Receiver};
 
@@ -220,6 +221,7 @@ impl App {
             KeyAction::ToggleUsage => self.disk_usage = !self.disk_usage,
             KeyAction::Help => self.modal = Modal::Help,
             KeyAction::Delete => self.request_delete(),
+            KeyAction::Open => self.open_selected(),
             KeyAction::Confirm | KeyAction::Cancel => {}
         }
     }
@@ -259,6 +261,22 @@ impl App {
             // Re-select the directory we just came out of.
             self.selected = Some(was);
             self.refocus();
+        }
+    }
+
+    /// Hand the selected entry to the platform's default handler: files open in their default
+    /// app, directories in the file manager. Non-destructive, so unlike delete it also works
+    /// in read-only mode and while a scan is still filling in the tree.
+    fn open_selected(&mut self) {
+        let Some(sel) = self.selected else { return };
+        if self.deleting_idx() == Some(sel) {
+            self.status = Some("can't open: this entry is being deleted".into());
+            return;
+        }
+        let path = self.tree.path_of(sel);
+        match open_path(&path) {
+            Ok(()) => self.status = Some(format!("opened {}", path)),
+            Err(e) => self.status = Some(format!("open failed: {e}")),
         }
     }
 
@@ -349,6 +367,46 @@ impl App {
     }
 }
 
+/// Launch the platform opener for `path` and wait for it to exit — the stock openers hand off
+/// to the OS and return immediately, and waiting reaps the child instead of leaving a zombie.
+/// Stdio is disconnected so the opener can't scribble on the TUI.
+fn open_path(path: &str) -> std::io::Result<()> {
+    let status = opener_command(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "opener exited with {status}"
+        )))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn opener_command(path: &str) -> Command {
+    let mut cmd = Command::new("open");
+    cmd.arg(path);
+    cmd
+}
+
+#[cfg(target_os = "windows")]
+fn opener_command(path: &str) -> Command {
+    // `start` treats its first quoted argument as the window title, so pass an empty one.
+    let mut cmd = Command::new("cmd");
+    cmd.args(["/C", "start", "", path]);
+    cmd
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn opener_command(path: &str) -> Command {
+    let mut cmd = Command::new("xdg-open");
+    cmd.arg(path);
+    cmd
+}
+
 /// A short type indicator for an entry (mirrors ncdu's column).
 pub fn indicator(kind: NodeKind, shared: bool, excluded: bool, read_error: bool) -> char {
     if read_error {
@@ -381,6 +439,7 @@ pub enum KeyAction {
     ToggleUsage,
     Help,
     Delete,
+    Open,
     Confirm,
     Cancel,
 }

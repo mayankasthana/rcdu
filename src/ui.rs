@@ -278,6 +278,7 @@ fn render_help(f: &mut Frame) {
         Line::from("  s                 toggle sort (size ↔ name)"),
         Line::from("  a                 toggle apparent ↔ disk usage"),
         Line::from("  d                 delete selected (confirm; needs full scan)"),
+        Line::from("  o                 open selected in default app / file manager"),
         Line::from("  ?                 toggle this help"),
         Line::from("  q / Esc / Ctrl-C  quit (during a delete: press twice to abort it)"),
         Line::from(""),
