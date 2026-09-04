@@ -121,7 +121,7 @@ results (`remove_dir_all` can't be cleanly cancelled). Any other key disarms the
 Build all three with the bundled script:
 
 ```sh
-./build-portable.sh        # outputs dist/rcdu-{linux-x86_64,linux-aarch64,macos-<arch>}
+./build-portable.sh        # outputs dist/rcdu-portable-{linux-x86_64,linux-aarch64,macos-<arch>}
 ```
 
 Prebuilt binaries for every release (Linux x86_64/ARM64 static musl, macOS
