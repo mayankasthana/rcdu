@@ -130,8 +130,10 @@ results (`remove_dir_all` can't be cleanly cancelled). Any other key disarms the
 
 ## Portable, dependency-free binaries
 
-`rcdu` makes **no external process calls** — no `du`, no coreutils, nothing. It's pure Rust
-`std`. The binaries are self-contained:
+`rcdu`'s core — scan, sort, delete, JSON import/export — makes **no external process calls**: no
+`du`, no coreutils, nothing; it's pure Rust `std`. Two features deliberately shell out: `o` hands
+the selected entry to the platform's default handler, and `rcdu update` downloads through `curl`.
+The binaries are self-contained:
 
 - **Linux** builds are **fully static musl** binaries: libc is baked in, there are no `.so`
   dependencies and no dynamic loader. Copy to any x86-64 or ARM64 Linux box — Alpine, Ubuntu,
@@ -173,7 +175,7 @@ RUSTFLAGS="-C linker=$LLD -C linker-flavor=ld.lld -C link-self-contained=yes" \
 | `model.rs` | The tree owned by the UI thread. Lean `Node` (`CompactString` names, derived own-size); grafts batches, propagates *counted* sizes up every ancestor, buffers out-of-order batches, tracks per-subtree "unscanned dirs" for the delete gate, and performs deletion. |
 | `glob.rs` | `fnmatch`-style globbing for `--exclude`. |
 | `dump.rs` | ncdu-compatible JSON import/export. |
-| `app.rs` | App state + key handling, modals (help/confirm), deletion. Selection tracks node *identity*, so the highlight doesn't jump as live updates reorder the list. |
+| `app.rs` | App state + key handling, modals (help/confirm), background delete and open. Selection tracks node *identity*, so the highlight doesn't jump as live updates reorder the list. |
 | `ui.rs` | ratatui rendering: size bars, percentages, type indicators, popups. |
 | `update.rs` | `rcdu update`: self-update from GitHub Releases — fetch latest tag, download the platform asset via `curl`, verify its checksum, atomically replace the binary. |
 | `sha256.rs` | Minimal SHA-256 (FIPS 180-4) so update verification needs no external tools or crates. |
@@ -194,8 +196,9 @@ buffered — verifying the concurrency and size-propagation logic.
 Implemented: live/progressive parallel scan, SSD-tuned threading, **navigation-prioritized
 scanning**, sort, apparent/disk toggle, delete (background, with the still-scanning safety gate,
 `-r`, and a guarded Ctrl-C), hard-link dedup, `--exclude` / `-X`, `-x` one-file-system, ncdu JSON
-import/export, self-update (`rcdu update`, with checksum verification), help dialog, a
-memory-lean node representation, and static portable binaries.
+import/export, open (`o`, via the platform's default handler), self-update (`rcdu update`, with
+checksum verification), help dialog, a memory-lean node representation, and static portable
+binaries.
 
 Possible future work: in-place refresh (`r`) of a subtree, the ncdu "shared/unique" size
 breakdown column, and a file-info panel. Further memory wins are available if needed (`u32`
