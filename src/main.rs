@@ -139,10 +139,11 @@ COMMANDS:
 
 KEYS:
     j/k, down/up    move          l/Enter/right   enter directory
-    h/Backspace     go up         s               toggle sort (size/name)
+    h/Backspace     go up         /               filter by name (Enter, Esc cancel)
+    s               toggle sort   g/G             top/bottom
     a               apparent/disk d               delete (confirm; needs full scan)
     o               open          ?               help
-    g/G             top/bottom    q/Esc           quit",
+    q/Esc           quit",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -364,7 +365,7 @@ fn run(
         if event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    if let Some(action) = decode_key(key.code, key.modifiers) {
+                    if let Some(action) = decode_key(key.code, key.modifiers, app.searching) {
                         app.on_key(action);
                     }
                 }
@@ -378,10 +379,22 @@ fn run(
     }
 }
 
-fn decode_key(code: KeyCode, mods: KeyModifiers) -> Option<KeyAction> {
+fn decode_key(code: KeyCode, mods: KeyModifiers, searching: bool) -> Option<KeyAction> {
+    // Ctrl-C quits even while a filter is being typed.
+    if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
+        return Some(KeyAction::Quit);
+    }
+    if searching {
+        return Some(match code {
+            KeyCode::Char(c) => KeyAction::FilterChar(c),
+            KeyCode::Backspace => KeyAction::FilterBackspace,
+            KeyCode::Enter => KeyAction::FilterConfirm,
+            KeyCode::Esc => KeyAction::FilterCancel,
+            _ => return None,
+        });
+    }
     Some(match code {
         KeyCode::Char('q') | KeyCode::Esc => KeyAction::Quit,
-        KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => KeyAction::Quit,
         KeyCode::Char('j') | KeyCode::Down => KeyAction::Down,
         KeyCode::Char('k') | KeyCode::Up => KeyAction::Up,
         KeyCode::Char('g') | KeyCode::Home => KeyAction::Top,
@@ -392,6 +405,7 @@ fn decode_key(code: KeyCode, mods: KeyModifiers) -> Option<KeyAction> {
         KeyCode::Char('a') => KeyAction::ToggleUsage,
         KeyCode::Char('d') => KeyAction::Delete,
         KeyCode::Char('o') => KeyAction::Open,
+        KeyCode::Char('/') => KeyAction::Search,
         KeyCode::Char('y') | KeyCode::Char('Y') => KeyAction::Confirm,
         KeyCode::Char('n') | KeyCode::Char('N') => KeyAction::Cancel,
         KeyCode::Char('?') => KeyAction::Help,

@@ -46,6 +46,13 @@ pub struct App {
     /// Currently highlighted child node (by identity), if any.
     pub selected: Option<NodeIdx>,
     pub sort: SortKey,
+    /// Incremental name filter (`/`): `Some(query)` while a filter is applied — possibly empty
+    /// while still typing — `None` when nothing is filtered.
+    pub filter: Option<String>,
+    /// True while the user is typing the filter; input is captured for it.
+    pub searching: bool,
+    /// Selection to restore if the filter being typed is cancelled.
+    pre_search_selected: Option<NodeIdx>,
     /// Show on-disk usage (`st_blocks`) vs. apparent size (`st_size`).
     pub disk_usage: bool,
     pub scanning: bool,
@@ -74,6 +81,9 @@ impl App {
             cur: tree.root,
             selected: None,
             sort: SortKey::Size,
+            filter: None,
+            searching: false,
+            pre_search_selected: None,
             disk_usage,
             scanning,
             read_only,
@@ -132,7 +142,8 @@ impl App {
         }
     }
 
-    /// Children of the current directory, sorted for display (largest first, or by name).
+    /// Children of the current directory, sorted for display (largest first, or by name), with
+    /// the active name filter (if any) applied on top.
     pub fn sorted_children(&self) -> Vec<NodeIdx> {
         let mut kids = self.tree.nodes[self.cur].children.clone();
         match self.sort {
@@ -145,6 +156,9 @@ impl App {
                 kids.sort_by(|&a, &b| self.tree.nodes[a].name.cmp(&self.tree.nodes[b].name))
             }
         }
+        if let Some(q) = &self.filter {
+            kids.retain(|&k| contains_ci(&self.tree.nodes[k].name, q));
+        }
         kids
     }
 
@@ -153,6 +167,12 @@ impl App {
             Some(sel) if kids.contains(&sel) => {}
             _ => self.selected = kids.first().copied(),
         }
+    }
+
+    /// While typing a filter, keep the selection on the first entry matching it.
+    fn snap_to_first_match(&mut self) {
+        let kids = self.sorted_children();
+        self.selected = kids.first().copied();
     }
 
     /// The node currently being deleted (its subtree is locked), if any.
@@ -185,6 +205,40 @@ impl App {
                 return;
             }
             Modal::None => {}
+        }
+
+        // While typing a filter, capture input: characters extend the query, Backspace erases,
+        // Enter applies it, Esc discards it and restores the prior selection. Navigation keys
+        // are inert meanwhile (they'd otherwise act on half-typed queries).
+        if self.searching {
+            match action {
+                KeyAction::FilterChar(c) => {
+                    if let Some(q) = &mut self.filter {
+                        q.push(c);
+                    }
+                    self.snap_to_first_match();
+                }
+                KeyAction::FilterBackspace => {
+                    if let Some(q) = &mut self.filter {
+                        q.pop();
+                    }
+                    self.snap_to_first_match();
+                }
+                KeyAction::FilterConfirm => {
+                    self.searching = false;
+                    if self.filter.as_ref().is_none_or(|q| q.is_empty()) {
+                        self.filter = None;
+                    }
+                }
+                KeyAction::FilterCancel => {
+                    self.searching = false;
+                    self.filter = None;
+                    self.selected = self.pre_search_selected.take();
+                    self.ensure_selection(&self.sorted_children());
+                }
+                _ => {}
+            }
+            return;
         }
 
         // Any key other than a repeated quit dismisses a stale status and disarms a pending
@@ -227,11 +281,24 @@ impl App {
                     SortKey::Name => SortKey::Size,
                 };
             }
+            KeyAction::Search => {
+                self.searching = true;
+                self.status = None;
+                self.pre_search_selected = self.selected;
+                if self.filter.is_none() {
+                    self.filter = Some(String::new());
+                }
+            }
             KeyAction::ToggleUsage => self.disk_usage = !self.disk_usage,
             KeyAction::Help => self.modal = Modal::Help,
             KeyAction::Delete => self.request_delete(),
             KeyAction::Open => self.open_selected(),
             KeyAction::Confirm | KeyAction::Cancel => {}
+            // Handled by the search-mode block above; unreachable here.
+            KeyAction::FilterChar(_)
+            | KeyAction::FilterBackspace
+            | KeyAction::FilterConfirm
+            | KeyAction::FilterCancel => {}
         }
     }
 
@@ -484,14 +551,125 @@ pub enum KeyAction {
     Open,
     Confirm,
     Cancel,
+    Search,
+    FilterChar(char),
+    FilterBackspace,
+    FilterConfirm,
+    FilterCancel,
+}
+
+/// Case-insensitive substring test used by the `/` filter. ASCII letters compare
+/// case-insensitively; other bytes must match exactly (a plain byte-substring test, so
+/// multi-byte UTF-8 names can't produce false positives). An empty needle matches everything,
+/// so a just-opened (still-empty) filter hides nothing.
+fn contains_ci(haystack: &str, needle: &str) -> bool {
+    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+    if n.is_empty() {
+        return true;
+    }
+    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Excluded, NodeKind};
 
     fn app() -> App {
         App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, false)
+    }
+
+    fn app_with_entries() -> App {
+        let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        for (name, kind, size) in [
+            ("alpha", NodeKind::File, 10u64),
+            ("Beta", NodeKind::File, 30),
+            ("banner", NodeKind::File, 20),
+            ("gamma", NodeKind::Dir, 5),
+        ] {
+            t.import_child(
+                t.root,
+                name.into(),
+                kind,
+                size,
+                size,
+                1,
+                1,
+                false,
+                false,
+                Excluded::No,
+                false,
+            );
+        }
+        App::new(t, true, false, false)
+    }
+
+    fn shown_names(app: &App) -> Vec<&str> {
+        app.sorted_children()
+            .iter()
+            .map(|&k| app.tree.nodes[k].name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn contains_ci_matches_ascii_case_insensitively() {
+        assert!(contains_ci("Hello, World", "WORLD"));
+        assert!(contains_ci("node_modules", "ODE_MOD"));
+        assert!(contains_ci("anything", ""));
+        assert!(!contains_ci("short", "shorter"));
+        assert!(
+            !contains_ci("résumé", "RESUME"),
+            "non-ASCII compares exactly"
+        );
+        assert!(contains_ci("résumé", "sum"));
+    }
+
+    #[test]
+    fn filter_narrows_live_and_applies_on_enter() {
+        let mut app = app_with_entries();
+        // Opening the filter (empty query) hides nothing.
+        app.on_key(KeyAction::Search);
+        assert_eq!(app.sorted_children().len(), 4);
+        app.on_key(KeyAction::FilterChar('b'));
+        assert_eq!(shown_names(&app), vec!["Beta", "banner"]);
+        assert_eq!(app.tree.nodes[app.selected.unwrap()].name, "Beta");
+        assert!(app.searching);
+
+        app.on_key(KeyAction::FilterChar('a'));
+        assert_eq!(shown_names(&app), vec!["banner"]);
+        assert_eq!(app.tree.nodes[app.selected.unwrap()].name, "banner");
+
+        app.on_key(KeyAction::FilterConfirm);
+        assert!(!app.searching);
+        assert_eq!(shown_names(&app), vec!["banner"], "filter persists");
+    }
+
+    #[test]
+    fn filter_cancel_restores_previous_selection() {
+        let mut app = app_with_entries();
+        app.on_key(KeyAction::Down); // select "banner" (2nd by size: 30, 20, 10, 5)
+        let before = app.selected;
+        app.on_key(KeyAction::Search);
+        app.on_key(KeyAction::FilterChar('g')); // only "gamma" matches
+        assert_eq!(shown_names(&app), vec!["gamma"]);
+        assert_ne!(app.selected, before);
+
+        app.on_key(KeyAction::FilterCancel);
+        assert!(app.filter.is_none());
+        assert_eq!(app.selected, before, "selection restored");
+        assert_eq!(shown_names(&app).len(), 4);
+    }
+
+    #[test]
+    fn empty_query_confirms_to_no_filter() {
+        let mut app = app_with_entries();
+        app.on_key(KeyAction::Search);
+        app.on_key(KeyAction::FilterChar('z'));
+        assert!(app.sorted_children().is_empty());
+        app.on_key(KeyAction::FilterBackspace);
+        app.on_key(KeyAction::FilterConfirm);
+        assert!(app.filter.is_none(), "empty query clears the filter");
+        assert_eq!(app.sorted_children().len(), 4);
     }
 
     /// A finished open lands in the status line and drains its slot, so the UI thread never
