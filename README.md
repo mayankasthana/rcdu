@@ -84,6 +84,7 @@ rcdu -f old.json -o new.json    # re-read and rewrite a dump (recomputes totals/
 | `/` | filter entries by name (type to filter live, Enter applies, Esc cancels) |
 | `a` | toggle apparent size ↔ on-disk usage |
 | `d` | delete selected entry (asks to confirm) |
+| `t` | show the largest files under the current directory |
 | `o` | open selected entry (default app; directories in the file manager) |
 | `?` | show the help dialog |
 | `q` / `Esc` | quit |
@@ -101,6 +102,14 @@ title shows `N of M items` and the footer echoes the query with match counts, so
 never silently on. `Enter` applies it (navigation, delete, and open then operate only on the
 matches); `Esc` cancels and restores the previous selection. The filter applies to whichever
 directory you're viewing until cleared.
+
+### Largest files
+
+Press `t` to see the largest regular files under the directory you're viewing, flattened across
+its whole subtree — "what exactly is eating this directory?" without descending level by level.
+Sizes follow the active metric (`a` toggles disk usage vs. apparent before opening the popup).
+`j`/`k` move, `Enter` jumps to the selected file's parent directory with the file highlighted,
+`q` closes. The popup holds the top 100 files as of when you opened it.
 
 ### Deleting
 

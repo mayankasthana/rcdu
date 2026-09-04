@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{indicator, App, Modal, SortKey};
+use crate::app::{indicator, App, Modal, SortKey, TopFiles};
 use crate::model::{Excluded, NodeKind};
 
 const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
@@ -53,11 +53,64 @@ pub fn render(f: &mut Frame, app: &App) {
     render_list(f, app, chunks[1]);
     render_footer(f, app, chunks[2]);
 
-    match app.modal {
+    match &app.modal {
         Modal::Help => render_help(f),
-        Modal::ConfirmDelete(idx) => render_confirm(f, app, idx),
+        Modal::ConfirmDelete(idx) => render_confirm(f, app, *idx),
+        Modal::TopFiles(tf) => render_top_files(f, app, tf),
         Modal::None => {}
     }
+}
+
+/// The top-files popup: largest regular files under the viewed directory, one row each, with
+/// the selection highlighted. `j`/`k` move, `Enter` jumps to the file's parent, `q` closes.
+fn render_top_files(f: &mut Frame, app: &App, tf: &TopFiles) {
+    let width = f.area().width.saturating_sub(4).clamp(28, 96);
+    let height = (tf.items.len() as u16 + 5)
+        .min(f.area().height.saturating_sub(2))
+        .max(7);
+    let area = popup(f.area(), width, height);
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Top files in {} ", app.tree.nodes[app.cur].name));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let [list_area, hint_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    let metric = if app.disk_usage {
+        "disk usage"
+    } else {
+        "apparent size"
+    };
+    let items: Vec<ListItem> = tf
+        .items
+        .iter()
+        .map(|e| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:>10}  ", fmt_size(e.size)),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::raw(e.path.clone()),
+            ]))
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(tf.selected));
+    f.render_stateful_widget(
+        List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
+        list_area,
+        &mut state,
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" j/k move · Enter go to file · q close   (sizes: {metric})"),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        hint_area,
+    );
 }
 
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
@@ -312,6 +365,7 @@ fn render_help(f: &mut Frame) {
         Line::from("  a                 toggle apparent ↔ disk usage"),
         Line::from("  d                 delete selected (confirm; needs full scan)"),
         Line::from("  o                 open selected in default app / file manager"),
+        Line::from("  t                 largest files under this directory"),
         Line::from("  ?                 toggle this help"),
         Line::from("  q / Esc / Ctrl-C  quit (during a delete: press twice to abort it)"),
         Line::from(""),
