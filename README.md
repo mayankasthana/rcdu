@@ -79,6 +79,7 @@ rcdu -f old.json -o new.json    # re-read and rewrite a dump (recomputes totals/
 | `s` | toggle sort (size ↔ name) |
 | `a` | toggle apparent size ↔ on-disk usage |
 | `d` | delete selected entry (asks to confirm) |
+| `o` | open selected entry (default app; directories in the file manager) |
 | `?` | show the help dialog |
 | `q` / `Esc` | quit |
 

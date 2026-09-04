@@ -350,6 +350,7 @@ fn decode_key(code: KeyCode, mods: KeyModifiers) -> Option<KeyAction> {
         KeyCode::Char('s') => KeyAction::ToggleSort,
         KeyCode::Char('a') => KeyAction::ToggleUsage,
         KeyCode::Char('d') => KeyAction::Delete,
+        KeyCode::Char('o') => KeyAction::Open,
         KeyCode::Char('y') | KeyCode::Char('Y') => KeyAction::Confirm,
         KeyCode::Char('n') | KeyCode::Char('N') => KeyAction::Cancel,
         KeyCode::Char('?') => KeyAction::Help,
