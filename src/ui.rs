@@ -300,8 +300,12 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     }
 
     let status = if app.scanning {
+        let rate = app
+            .scan_rate()
+            .map(|b| format!("  {}/s", fmt_size(b).trim_start()))
+            .unwrap_or_default();
         format!(
-            "{} scanning  {} dirs  {} files",
+            "{} scanning{rate}  {} dirs  {} files",
             SPINNER[app.tick % SPINNER.len()],
             app.tree.total_dirs,
             app.tree.total_files,
