@@ -138,12 +138,12 @@ COMMANDS:
 
 KEYS:
     j/k, down/up    move          l/Enter/right   enter directory
-    h/Backspace     go up         /               filter by name (Enter, Esc cancel)
-    s               toggle sort   t               largest files under this dir
-    a               apparent/disk r               rescan selected dir in place
-    d               delete (confirm; needs full scan)
+    h/Backspace     go up         PgUp/PgDn,C-d/u page
+    /               filter names  s               toggle sort
+    t               top files     r               rescan selected dir
+    a               apparent/disk d               delete (confirm; full scan)
     o               open          ?               help
-    q/Esc           quit",
+    g/G, Home/End   top/bottom    q/Esc           quit",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -339,7 +339,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
         if event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    if let Some(action) = decode_key(key.code, key.modifiers, app.searching) {
+                    // Page height = list rows (total minus header, footer, and the list's two
+                    // border rows), used by PgUp/PgDn and C-d/C-u.
+                    let page = terminal
+                        .size()
+                        .map(|s| (s.height.saturating_sub(5) as usize).max(1))
+                        .unwrap_or(20);
+                    if let Some(action) = decode_key(key.code, key.modifiers, app.searching, page) {
                         app.on_key(action);
                     }
                 }
@@ -353,7 +359,12 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
     }
 }
 
-fn decode_key(code: KeyCode, mods: KeyModifiers, searching: bool) -> Option<KeyAction> {
+fn decode_key(
+    code: KeyCode,
+    mods: KeyModifiers,
+    searching: bool,
+    page: usize,
+) -> Option<KeyAction> {
     // Ctrl-C quits even while a filter is being typed.
     if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
         return Some(KeyAction::Quit);
@@ -371,6 +382,11 @@ fn decode_key(code: KeyCode, mods: KeyModifiers, searching: bool) -> Option<KeyA
         KeyCode::Char('q') | KeyCode::Esc => KeyAction::Quit,
         KeyCode::Char('j') | KeyCode::Down => KeyAction::Down,
         KeyCode::Char('k') | KeyCode::Up => KeyAction::Up,
+        KeyCode::PageDown => KeyAction::PageDown(page),
+        KeyCode::PageUp => KeyAction::PageUp(page),
+        // Vim-style half-keys map to a full page; kept ahead of the plain `d` (delete) arm.
+        KeyCode::Char('d') if mods.contains(KeyModifiers::CONTROL) => KeyAction::PageDown(page),
+        KeyCode::Char('u') if mods.contains(KeyModifiers::CONTROL) => KeyAction::PageUp(page),
         KeyCode::Char('g') | KeyCode::Home => KeyAction::Top,
         KeyCode::Char('G') | KeyCode::End => KeyAction::Bottom,
         KeyCode::Char('l') | KeyCode::Enter | KeyCode::Right => KeyAction::Enter,

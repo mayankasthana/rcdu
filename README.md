@@ -80,6 +80,7 @@ rcdu -f old.json -o new.json    # re-read and rewrite a dump (recomputes totals/
 | `l` / `Enter` / `→` | enter directory |
 | `h` / `Backspace` / `←` | go up |
 | `g` / `G` | jump to top / bottom |
+| `PgUp` / `PgDn`, `Ctrl-d` / `Ctrl-u` | page up / down |
 | `s` | toggle sort (size ↔ name) |
 | `/` | filter entries by name (type to filter live, Enter applies, Esc cancels) |
 | `a` | toggle apparent size ↔ on-disk usage |
