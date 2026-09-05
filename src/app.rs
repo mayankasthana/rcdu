@@ -347,7 +347,16 @@ impl App {
     /// Children of the current directory, sorted for display (largest first, or by name), with
     /// the active name filter (if any) applied on top.
     pub fn sorted_children(&self) -> Vec<NodeIdx> {
-        let mut kids = self.tree.nodes[self.cur].children.clone();
+        let mut kids = self.order_children(self.tree.nodes[self.cur].children.clone());
+        if let Some(q) = &self.filter {
+            kids.retain(|&k| contains_ci(&self.tree.nodes[k].name, q));
+        }
+        kids
+    }
+
+    /// Sort children the way every view presents them (largest first, or by name), so
+    /// traversals like the next-error jump match what the user sees on screen.
+    fn order_children(&self, mut kids: Vec<NodeIdx>) -> Vec<NodeIdx> {
         match self.sort {
             SortKey::Size => kids.sort_by(|&a, &b| {
                 self.size_of(b)
@@ -358,10 +367,43 @@ impl App {
                 kids.sort_by(|&a, &b| self.tree.nodes[a].name.cmp(&self.tree.nodes[b].name))
             }
         }
-        if let Some(q) = &self.filter {
-            kids.retain(|&k| contains_ci(&self.tree.nodes[k].name, q));
-        }
         kids
+    }
+
+    /// Jump to the next entry flagged with a read error (`!`), searching forward from the
+    /// current selection in display order and wrapping around. The view moves to the entry's
+    /// parent directory with it selected.
+    fn jump_to_next_error(&mut self) {
+        let mut order = Vec::new();
+        let mut stack = vec![self.tree.root];
+        while let Some(idx) = stack.pop() {
+            order.push(idx);
+            // Pushed reversed so the pop order is display order.
+            stack.extend(
+                self.order_children(self.tree.nodes[idx].children.clone())
+                    .iter()
+                    .rev(),
+            );
+        }
+        let anchor = self.selected.unwrap_or(self.cur);
+        let pos = order.iter().position(|&i| i == anchor).unwrap_or(0);
+        for step in 1..=order.len() {
+            let idx = order[(pos + step) % order.len()];
+            if !self.tree.nodes[idx].read_error {
+                continue;
+            }
+            if idx == self.tree.root {
+                self.cur = self.tree.root;
+                self.selected = None;
+            } else {
+                self.cur = self.tree.nodes[idx].parent.unwrap();
+                self.selected = Some(idx);
+            }
+            self.refocus();
+            self.status = Some(format!("read error: {}", self.tree.path_of(idx)));
+            return;
+        }
+        self.status = Some("no read errors".into());
     }
 
     fn ensure_selection(&mut self, kids: &[NodeIdx]) {
@@ -650,6 +692,7 @@ impl App {
             KeyAction::Refresh => self.request_refresh(),
             KeyAction::Info => self.open_info(),
             KeyAction::Export => self.request_export(),
+            KeyAction::NextError => self.jump_to_next_error(),
             KeyAction::Confirm | KeyAction::Cancel => {}
             // Handled by the search-mode block above; unreachable here.
             KeyAction::FilterChar(_)
@@ -922,6 +965,7 @@ pub enum KeyAction {
     PageDown(usize),
     PageUp(usize),
     Export,
+    NextError,
 }
 
 /// First free `rcdu-dump*.json` path in `dir`, so consecutive exports never clobber each
@@ -1370,5 +1414,62 @@ mod tests {
             "rcdu-dump-3.json"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An app whose entries include read errors, in display order (by size):
+    /// big(500), broken(400, error), brokendir(300, error, has a child), small(100).
+    fn app_with_errors() -> App {
+        let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        for (name, kind, size, err) in [
+            ("big", NodeKind::File, 500u64, false),
+            ("broken", NodeKind::File, 400, true),
+            ("brokendir", NodeKind::Dir, 300, true),
+            ("small", NodeKind::File, 100, false),
+        ] {
+            t.import_child(
+                t.root,
+                name.into(),
+                kind,
+                size,
+                size,
+                1,
+                1,
+                false,
+                false,
+                Excluded::No,
+                err,
+            );
+        }
+        App::new(t, true, false, false)
+    }
+
+    /// The jump lands on each error entry in display order, moves the view to its parent,
+    /// and wraps around after the last one.
+    #[test]
+    fn next_error_jumps_in_display_order_and_wraps() {
+        let mut app = app_with_errors();
+        // Initial selection is the first row ("big"); the first error after it is "broken".
+        app.on_key(KeyAction::NextError);
+        assert_eq!(app.tree.nodes[app.selected.unwrap()].name, "broken");
+        assert_eq!(app.tree.nodes[app.cur].name, "/r");
+        assert_eq!(app.status.as_deref(), Some("read error: /r/broken"));
+
+        app.on_key(KeyAction::NextError);
+        assert_eq!(app.tree.nodes[app.selected.unwrap()].name, "brokendir");
+
+        // Wrapped: both errors seen, back to the first.
+        app.on_key(KeyAction::NextError);
+        assert_eq!(app.tree.nodes[app.selected.unwrap()].name, "broken");
+    }
+
+    /// With no errors anywhere, nothing moves and the footer says so.
+    #[test]
+    fn next_error_without_errors_reports_none() {
+        let mut app = app_with_entries();
+        app.on_key(KeyAction::Down); // settle the selection (first key always selects)
+        let before = app.selected;
+        app.on_key(KeyAction::NextError);
+        assert_eq!(app.selected, before);
+        assert_eq!(app.status.as_deref(), Some("no read errors"));
     }
 }
