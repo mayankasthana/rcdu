@@ -140,7 +140,7 @@ COMMANDS:
 KEYS:
     j/k, down/up    move          l/Enter/right   enter directory
     h/Backspace     go up         /               filter by name (Enter, Esc cancel)
-    s               toggle sort   g/G             top/bottom
+    s               toggle sort   t               largest files under this dir
     a               apparent/disk d               delete (confirm; needs full scan)
     o               open          ?               help
     q/Esc           quit",
@@ -405,6 +405,7 @@ fn decode_key(code: KeyCode, mods: KeyModifiers, searching: bool) -> Option<KeyA
         KeyCode::Char('a') => KeyAction::ToggleUsage,
         KeyCode::Char('d') => KeyAction::Delete,
         KeyCode::Char('o') => KeyAction::Open,
+        KeyCode::Char('t') => KeyAction::TopFiles,
         KeyCode::Char('/') => KeyAction::Search,
         KeyCode::Char('y') | KeyCode::Char('Y') => KeyAction::Confirm,
         KeyCode::Char('n') | KeyCode::Char('N') => KeyAction::Cancel,

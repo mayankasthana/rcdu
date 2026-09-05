@@ -17,12 +17,31 @@ pub enum SortKey {
     Name,
 }
 
+/// One row of the top-files popup: a file, its path relative to the directory the popup was
+/// opened from, and its size in the metric active when the popup was opened.
+pub struct TopEntry {
+    pub idx: NodeIdx,
+    pub path: String,
+    pub size: u64,
+}
+
+/// State of the top-files popup (largest files under the viewed directory).
+pub struct TopFiles {
+    pub items: Vec<TopEntry>,
+    pub selected: usize,
+}
+
+/// How many rows the top-files popup shows.
+const TOP_FILES_LIMIT: usize = 100;
+
 /// A transient modal overlay.
 pub enum Modal {
     None,
     Help,
     /// Confirm deletion of the given node.
     ConfirmDelete(NodeIdx),
+    /// The largest files under the directory the popup was opened from.
+    TopFiles(Box<TopFiles>),
 }
 
 /// An in-progress deletion running on a background thread, so the UI stays responsive and shows
@@ -175,6 +194,47 @@ impl App {
         self.selected = kids.first().copied();
     }
 
+    /// Open the top-files popup for the directory currently being viewed.
+    fn open_top_files(&mut self) {
+        let items = self.top_files(self.cur, TOP_FILES_LIMIT);
+        if items.is_empty() {
+            self.status = Some("no files under this directory".into());
+            return;
+        }
+        self.modal = Modal::TopFiles(Box::new(TopFiles { items, selected: 0 }));
+    }
+
+    /// The largest regular files under `from`, largest first, with paths relative to it.
+    /// Computed on demand (a subtree walk) so it costs nothing during the scan; entries are a
+    /// snapshot of the current sizes, which is exactly what the popup shows.
+    pub fn top_files(&self, from: NodeIdx, limit: usize) -> Vec<TopEntry> {
+        let mut out: Vec<TopEntry> = Vec::new();
+        let mut stack = vec![(from, String::new())];
+        while let Some((dir, prefix)) = stack.pop() {
+            for &c in &self.tree.nodes[dir].children {
+                let n = &self.tree.nodes[c];
+                let path = if prefix.is_empty() {
+                    n.name.to_string()
+                } else {
+                    format!("{prefix}/{}", n.name)
+                };
+                match n.kind {
+                    NodeKind::Dir => stack.push((c, path)),
+                    NodeKind::File => out.push(TopEntry {
+                        idx: c,
+                        path,
+                        size: self.size_of(c),
+                    }),
+                    // Symlinks and special files are not "biggest file" material.
+                    _ => {}
+                }
+            }
+        }
+        out.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
+        out.truncate(limit);
+        out
+    }
+
     /// The node currently being deleted (its subtree is locked), if any.
     pub fn deleting_idx(&self) -> Option<NodeIdx> {
         self.pending_delete.as_ref().map(|p| p.idx)
@@ -184,23 +244,47 @@ impl App {
         // Note: a background deletion does NOT block input — the user can keep browsing. Only
         // the subtree being deleted is locked (see `descend` and `request_delete`).
 
-        // Modal overlays capture input first.
-        match self.modal {
-            Modal::Help => {
-                self.modal = Modal::None;
-                return;
-            }
+        // Modal overlays capture input first. The modal is taken out (popups carry state), so
+        // every arm that keeps it open must put it back.
+        match std::mem::replace(&mut self.modal, Modal::None) {
+            Modal::Help => return,
             Modal::ConfirmDelete(idx) => {
                 match action {
-                    KeyAction::Confirm => {
-                        self.modal = Modal::None;
-                        self.perform_delete(idx);
-                    }
+                    KeyAction::Confirm => self.perform_delete(idx),
                     KeyAction::Quit | KeyAction::Leave | KeyAction::Cancel => {
-                        self.modal = Modal::None;
                         self.status = Some("delete cancelled".into());
                     }
-                    _ => {}
+                    // Any other key: keep waiting in the dialog.
+                    _ => self.modal = Modal::ConfirmDelete(idx),
+                }
+                return;
+            }
+            Modal::TopFiles(mut tf) => {
+                let last = tf.items.len().saturating_sub(1);
+                match action {
+                    KeyAction::Down => tf.selected = (tf.selected + 1).min(last),
+                    KeyAction::Up => tf.selected = tf.selected.saturating_sub(1),
+                    KeyAction::Top => tf.selected = 0,
+                    KeyAction::Bottom => tf.selected = last,
+                    KeyAction::Enter => {
+                        let idx = tf.items[tf.selected].idx;
+                        // The tree may have changed since the popup opened (deletions and
+                        // rescans tombstone nodes): only jump if the entry is still attached.
+                        let live = self.tree.nodes[idx]
+                            .parent
+                            .is_some_and(|p| self.tree.nodes[p].children.contains(&idx));
+                        if live {
+                            self.cur = self.tree.nodes[idx].parent.unwrap();
+                            self.selected = Some(idx);
+                            self.refocus();
+                        } else {
+                            self.status = Some("that entry is no longer in the tree".into());
+                        }
+                    }
+                    // q / Esc / h / ? close the popup without changing the view.
+                    KeyAction::Quit | KeyAction::Leave | KeyAction::Cancel | KeyAction::Help => {}
+                    // Anything else: keep the popup open exactly as it was.
+                    _ => self.modal = Modal::TopFiles(tf),
                 }
                 return;
             }
@@ -293,6 +377,7 @@ impl App {
             KeyAction::Help => self.modal = Modal::Help,
             KeyAction::Delete => self.request_delete(),
             KeyAction::Open => self.open_selected(),
+            KeyAction::TopFiles => self.open_top_files(),
             KeyAction::Confirm | KeyAction::Cancel => {}
             // Handled by the search-mode block above; unreachable here.
             KeyAction::FilterChar(_)
@@ -556,6 +641,7 @@ pub enum KeyAction {
     FilterBackspace,
     FilterConfirm,
     FilterCancel,
+    TopFiles,
 }
 
 /// Case-insensitive substring test used by the `/` filter. ASCII letters compare
@@ -670,6 +756,99 @@ mod tests {
         app.on_key(KeyAction::FilterConfirm);
         assert!(app.filter.is_none(), "empty query clears the filter");
         assert_eq!(app.sorted_children().len(), 4);
+    }
+
+    fn app_with_tree_for_top_files() -> App {
+        let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        t.import_child(
+            t.root,
+            "big.bin".into(),
+            NodeKind::File,
+            900,
+            900,
+            1,
+            1,
+            false,
+            false,
+            Excluded::No,
+            false,
+        );
+        let sub = t.import_child(
+            t.root,
+            "sub".into(),
+            NodeKind::Dir,
+            500,
+            500,
+            1,
+            2,
+            false,
+            false,
+            Excluded::No,
+            false,
+        );
+        t.import_child(
+            sub,
+            "mid.bin".into(),
+            NodeKind::File,
+            500,
+            500,
+            1,
+            3,
+            false,
+            false,
+            Excluded::No,
+            false,
+        );
+        t.import_child(
+            t.root,
+            "ln".into(),
+            NodeKind::Link,
+            100,
+            100,
+            1,
+            4,
+            false,
+            false,
+            Excluded::No,
+            false,
+        );
+        App::new(t, true, false, false)
+    }
+
+    #[test]
+    fn top_files_lists_files_largest_first_with_relative_paths() {
+        let app = app_with_tree_for_top_files();
+        let top = app.top_files(app.tree.root, 10);
+        assert_eq!(
+            top.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+            vec!["big.bin", "sub/mid.bin"],
+            "files only (no dirs, no symlinks), largest first, relative paths"
+        );
+        assert_eq!(top[0].size, 900);
+        assert_eq!(app.top_files(app.tree.root, 1).len(), 1, "limit applies");
+    }
+
+    #[test]
+    fn top_files_popup_navigation_and_jump() {
+        let mut app = app_with_tree_for_top_files();
+        app.on_key(KeyAction::TopFiles);
+        let items = match &app.modal {
+            Modal::TopFiles(tf) => tf.items.len(),
+            _ => panic!("top-files popup did not open"),
+        };
+        assert_eq!(items, 2);
+        app.on_key(KeyAction::Down); // select the second row (sub/mid.bin)
+        app.on_key(KeyAction::Enter);
+        assert!(matches!(app.modal, Modal::None), "jump closes the popup");
+        assert_eq!(
+            app.tree.nodes[app.cur].name, "sub",
+            "landed in the parent dir"
+        );
+        assert_eq!(
+            app.tree.nodes[app.selected.unwrap()].name,
+            "mid.bin",
+            "file is selected"
+        );
     }
 
     /// A finished open lands in the status line and drains its slot, so the UI thread never
