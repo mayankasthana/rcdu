@@ -143,7 +143,7 @@ KEYS:
     t               top files     r               rescan selected dir
     a               apparent/disk d               delete (confirm; full scan)
     o               open          i               entry details
-    g/G, Home/End   top/bottom    ?               help    q/Esc  quit",
+    e               export JSON   ?               help    q/Esc  quit",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -398,6 +398,7 @@ fn decode_key(
         KeyCode::Char('t') => KeyAction::TopFiles,
         KeyCode::Char('r') => KeyAction::Refresh,
         KeyCode::Char('i') => KeyAction::Info,
+        KeyCode::Char('e') => KeyAction::Export,
         KeyCode::Char('/') => KeyAction::Search,
         KeyCode::Char('y') | KeyCode::Char('Y') => KeyAction::Confirm,
         KeyCode::Char('n') | KeyCode::Char('N') => KeyAction::Cancel,

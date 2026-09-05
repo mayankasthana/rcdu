@@ -3,8 +3,9 @@
 //! Selection tracks a node's *identity*, not its row position, so the highlight stays glued to
 //! the same entry even as live size updates reshuffle the sort order during a scan.
 
+use std::io::{BufWriter, Write};
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
@@ -299,6 +300,29 @@ impl App {
         }
         let started = self.scan_started?;
         Some(self.bytes_seen / started.elapsed().as_secs().max(1))
+    }
+
+    /// Export the whole tree as it is right now (including deletions made this session) to the
+    /// next free `rcdu-dump*.json` in the working directory, in the same ncdu format as `-o`.
+    /// Synchronous: dumps write fast relative to scanning, and the outcome lands in the
+    /// status line.
+    fn request_export(&mut self) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let path = next_export_path(&cwd);
+        match self.export_tree_to(&path) {
+            Ok(()) => {
+                let entries = self.tree.total_dirs + self.tree.total_files;
+                self.status = Some(format!("exported {entries} entries to {}", path.display()));
+            }
+            Err(e) => self.status = Some(format!("export failed: {e}")),
+        }
+    }
+
+    /// Write the tree as ncdu-compatible JSON (the `-o` format, via `dump::export`).
+    fn export_tree_to(&self, path: &Path) -> std::io::Result<()> {
+        let mut w = BufWriter::new(std::fs::File::create(path)?);
+        crate::dump::export(&self.tree, &mut w)?;
+        w.flush()
     }
 
     /// The aggregated size metric we currently sort and display by.
@@ -625,6 +649,7 @@ impl App {
             KeyAction::TopFiles => self.open_top_files(),
             KeyAction::Refresh => self.request_refresh(),
             KeyAction::Info => self.open_info(),
+            KeyAction::Export => self.request_export(),
             KeyAction::Confirm | KeyAction::Cancel => {}
             // Handled by the search-mode block above; unreachable here.
             KeyAction::FilterChar(_)
@@ -896,6 +921,19 @@ pub enum KeyAction {
     /// Jump by this many rows (the visible page height).
     PageDown(usize),
     PageUp(usize),
+    Export,
+}
+
+/// First free `rcdu-dump*.json` path in `dir`, so consecutive exports never clobber each
+/// other (or an unrelated file that happens to share the name).
+fn next_export_path(dir: &Path) -> PathBuf {
+    if !dir.join("rcdu-dump.json").exists() {
+        return dir.join("rcdu-dump.json");
+    }
+    (2..)
+        .map(|n| dir.join(format!("rcdu-dump-{n}.json")))
+        .find(|p| !p.exists())
+        .expect("a free path always exists")
 }
 
 /// Split Unix seconds into UTC civil date/time (Howard Hinnant's civil-from-days).
@@ -1290,5 +1328,47 @@ mod tests {
         app.on_key(KeyAction::Quit);
         assert!(matches!(app.modal, Modal::None));
         assert!(!app.quit, "closing info must not quit");
+    }
+
+    /// An exported dump is readable again by the importer, with the same totals and children.
+    #[test]
+    fn export_writes_an_importable_dump() {
+        let app = app_with_entries();
+        let dir = std::env::temp_dir().join(format!("rcdu_export_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dump.json");
+        app.export_tree_to(&path).unwrap();
+        let re = crate::dump::import(std::io::BufReader::new(std::fs::File::open(&path).unwrap()))
+            .unwrap();
+        assert_eq!(
+            re.nodes[re.root].apparent, app.tree.nodes[app.tree.root].apparent,
+            "totals survive the round-trip"
+        );
+        assert_eq!(re.nodes[re.root].children.len(), 4);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Consecutive exports pick the first free `rcdu-dump*.json` name instead of clobbering.
+    #[test]
+    fn export_paths_avoid_clobbering() {
+        let dir = std::env::temp_dir().join(format!("rcdu_export_name_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            next_export_path(&dir).file_name().unwrap(),
+            "rcdu-dump.json"
+        );
+        std::fs::write(dir.join("rcdu-dump.json"), b"x").unwrap();
+        assert_eq!(
+            next_export_path(&dir).file_name().unwrap(),
+            "rcdu-dump-2.json"
+        );
+        std::fs::write(dir.join("rcdu-dump-2.json"), b"x").unwrap();
+        assert_eq!(
+            next_export_path(&dir).file_name().unwrap(),
+            "rcdu-dump-3.json"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
