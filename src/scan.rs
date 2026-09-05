@@ -126,6 +126,7 @@ pub struct Scan {
 }
 
 /// Scan configuration.
+#[derive(Clone)]
 pub struct Opts {
     pub threads: usize,
     /// Don't cross filesystem boundaries (ncdu `-x`).
@@ -158,16 +159,31 @@ pub fn default_threads() -> usize {
     (cores * 4).clamp(4, 64)
 }
 
+/// Id-space width of one scan generation. A scan started with `id_base` uses it for its root
+/// directory and allocates further ids above it. Subtree rescans run concurrently with the
+/// original scan, so each generation gets a disjoint id range (see [`start_at`]).
+pub const SCAN_ID_STRIDE: u64 = 1 << 40;
+
 /// Start scanning `root` (already assigned tree id 0).
 /// The event channel disconnects when the scan is done.
 pub fn start(root: PathBuf, opts: Opts) -> Scan {
+    start_at(root, opts, 0)
+}
+
+/// Start scanning `root`, treating it as tree id `id_base`: a whole-tree scan passes 0, while
+/// a subtree rescan passes its generation's base (a multiple of [`SCAN_ID_STRIDE`]) so its ids
+/// never collide with another scan streaming into the same tree.
+pub fn start_at(root: PathBuf, opts: Opts, id_base: u64) -> Scan {
     let (ev_tx, ev_rx) = unbounded::<Batch>();
 
     let frontier: FrontierArc = Arc::new((
         Mutex::new(Frontier {
             focus: None,
             hot: VecDeque::new(),
-            cold: VecDeque::from([DirJob { id: 0, path: root }]),
+            cold: VecDeque::from([DirJob {
+                id: id_base,
+                path: root,
+            }]),
             pending: 1, // the root job
             done: false,
         }),
@@ -176,7 +192,7 @@ pub fn start(root: PathBuf, opts: Opts) -> Scan {
 
     let shared = Arc::new(Shared {
         ev_tx,
-        next_id: AtomicU64::new(1), // 0 is reserved for the root
+        next_id: AtomicU64::new(id_base + 1),
         one_file_system: opts.one_file_system,
         root_dev: opts.root_dev,
         excludes: opts.excludes,
@@ -612,6 +628,109 @@ mod tests {
             last_target < last_slow,
             "focused 'target' subtree should finish before 'slow' (target@{last_target}, slow@{last_slow})"
         );
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Subtree rescan end-to-end: after the whole tree is scanned, `Tree::begin_refresh` tears
+    /// down one subtree (keeping ancestor totals consistent) and `start_at` with a fresh id
+    /// base re-scans it in place, picking up on-disk changes and restoring totals.
+    #[test]
+    fn subtree_rescan_restores_totals_and_picks_up_changes() {
+        let base = std::env::temp_dir().join(format!("rcdu_rescan_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("target/inner")).unwrap();
+        fs::create_dir_all(base.join("other")).unwrap();
+        fs::write(base.join("target/f1"), vec![b'x'; 1000]).unwrap();
+        fs::write(base.join("target/inner/f2"), vec![b'x'; 2000]).unwrap();
+        fs::write(base.join("other/f3"), vec![b'x'; 4000]).unwrap();
+
+        let meta = fs::symlink_metadata(&base).unwrap();
+        let mut tree = Tree::new(
+            "root".into(),
+            meta.len(),
+            meta.blocks() * 512,
+            meta.dev(),
+            meta.ino(),
+        );
+        let rx = start(base.clone(), opts(4, meta.dev())).events;
+        for batch in rx.iter() {
+            tree.apply(batch);
+        }
+        tree.finish_scan();
+
+        let target = tree.nodes[tree.root]
+            .children
+            .iter()
+            .find(|&&c| tree.nodes[c].name == "target")
+            .copied()
+            .expect("target present");
+        let root_total_before = tree.nodes[tree.root].apparent;
+        let target_agg_before = tree.nodes[target].apparent;
+        let target_own_before = tree.own_apparent(target);
+        let files_before = tree.total_files;
+        assert!(tree.subtree_complete(target));
+
+        // On-disk change while nobody is looking: a new file appears in the subtree.
+        fs::write(base.join("target/inner/new"), vec![b'x'; 7000]).unwrap();
+
+        // Tear the subtree down in the model, then rescan just that directory into it.
+        let id_base = SCAN_ID_STRIDE;
+        tree.begin_refresh(target, id_base);
+        assert!(
+            !tree.subtree_complete(target),
+            "rescan in progress: subtree incomplete"
+        );
+        assert!(tree.nodes[target].children.is_empty(), "children detached");
+        assert_eq!(
+            tree.nodes[target].apparent, target_own_before,
+            "aggregate reset to own size"
+        );
+        assert_eq!(
+            tree.nodes[tree.root].apparent,
+            root_total_before - target_agg_before + target_own_before,
+            "ancestor total stays consistent across the reset"
+        );
+
+        let rx = start_at(base.join("target"), opts(4, meta.dev()), id_base).events;
+        for batch in rx.iter() {
+            tree.apply(batch);
+        }
+        assert!(tree.subtree_complete(target), "rescan completed");
+        assert!(tree.orphans_is_empty(), "no batch left buffered");
+        assert!(
+            tree.nodes[tree.root].apparent > root_total_before,
+            "rescan picked up the added bytes"
+        );
+        assert_eq!(tree.total_files, files_before + 1);
+        // The untouched branch is unaffected.
+        assert_eq!(tree.nodes[target].children.len(), 2, "f1 + inner");
+
+        // Ground truth: the refreshed tree must agree exactly with an independent fresh scan
+        // of the same on-disk state (this also absorbs directory-size drift from the new
+        // file, which makes a hand-computed total unreliable).
+        let mut fresh = Tree::new(
+            "root".into(),
+            meta.len(),
+            meta.blocks() * 512,
+            meta.dev(),
+            meta.ino(),
+        );
+        let rx = start(base.clone(), opts(4, meta.dev())).events;
+        for batch in rx.iter() {
+            fresh.apply(batch);
+        }
+        fresh.finish_scan();
+        assert_eq!(
+            tree.nodes[tree.root].apparent, fresh.nodes[fresh.root].apparent,
+            "root apparent matches a fresh scan"
+        );
+        assert_eq!(
+            tree.nodes[tree.root].disk, fresh.nodes[fresh.root].disk,
+            "root disk usage matches a fresh scan"
+        );
+        assert_eq!(tree.total_files, fresh.total_files);
+        assert_eq!(tree.total_dirs, fresh.total_dirs);
 
         fs::remove_dir_all(&base).unwrap();
     }

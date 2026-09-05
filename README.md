@@ -85,6 +85,7 @@ rcdu -f old.json -o new.json    # re-read and rewrite a dump (recomputes totals/
 | `a` | toggle apparent size ↔ on-disk usage |
 | `d` | delete selected entry (asks to confirm) |
 | `t` | show the largest files under the current directory |
+| `r` | rescan the selected directory in place |
 | `o` | open selected entry (default app; directories in the file manager) |
 | `?` | show the help dialog |
 | `q` / `Esc` | quit |
@@ -110,6 +111,17 @@ its whole subtree — "what exactly is eating this directory?" without descendin
 Sizes follow the active metric (`a` toggles disk usage vs. apparent before opening the popup).
 `j`/`k` move, `Enter` jumps to the selected file's parent directory with the file highlighted,
 `q` closes. The popup holds the top 100 files as of when you opened it.
+
+### Rescanning in place
+
+Press `r` on a directory to rescan it from disk without restarting: the subtree's current
+children are replaced as the new scan streams back in, the entry shows a spinner until it
+completes, and the totals of surrounding directories stay correct throughout. Navigation keeps
+steering the rescan, so the directory you're viewing fills in first. The same guards as delete
+apply: the directory must have finished scanning, only one rescan runs at a time, and a
+directory being deleted cannot be rescanned. One limitation: hard links that cross the rescan
+boundary (one link inside, another outside the rescanned subtree) are each counted, so totals
+can slightly overcount until a full restart.
 
 ### Deleting
 

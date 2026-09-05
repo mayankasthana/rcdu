@@ -304,6 +304,51 @@ impl Tree {
         (dirs, files)
     }
 
+    /// Prepare a subtree for an in-place rescan (`r`): its children are detached (and dropped
+    /// from the global dir/file counts), its aggregates are reset to its own size — so every
+    /// ancestor's total stays correct while the rescan streams back in — and the subtree is
+    /// marked unscanned again. `id_base` registers the node as the root of a new scan
+    /// generation (see `scan::start_at`); batches from that scan graft back into this node.
+    pub fn begin_refresh(&mut self, idx: NodeIdx, id_base: u64) {
+        debug_assert!(self.nodes[idx].is_dir());
+        // Own size first: the aggregate minus the counted children is this node's own size,
+        // which is what the reset aggregate becomes.
+        let (own_apparent, own_disk) = (self.own_apparent(idx), self.own_disk(idx));
+
+        let mut stack = std::mem::take(&mut self.nodes[idx].children);
+        let mut dirs = 0u64;
+        let mut files = 0u64;
+        while let Some(n) = stack.pop() {
+            if self.nodes[n].is_dir() {
+                dirs += 1;
+            } else {
+                files += 1;
+            }
+            // Detach the grandchildren too: the nodes stay as tombstones (like delete), but
+            // they no longer hold on to their subtree.
+            let grandkids = std::mem::take(&mut self.nodes[n].children);
+            stack.extend_from_slice(&grandkids);
+        }
+        self.total_dirs = self.total_dirs.saturating_sub(dirs);
+        self.total_files = self.total_files.saturating_sub(files);
+
+        let n = &mut self.nodes[idx];
+        let removed_apparent = n.apparent.saturating_sub(own_apparent);
+        let removed_disk = n.disk.saturating_sub(own_disk);
+        let parent = n.parent;
+        n.apparent = own_apparent;
+        n.disk = own_disk;
+        n.scanned = false;
+        n.read_error = false;
+        n.unscanned = 1;
+        // The detached children's counted sizes are baked into every ancestor's aggregate —
+        // remove them, so totals stay correct while the rescan streams the subtree back in.
+        if let Some(parent) = parent {
+            self.sub_size(parent, removed_apparent, removed_disk);
+        }
+        self.dir_index.insert(id_base, idx);
+    }
+
     /// Build a filesystem path for a node, walking back to the root (whose name is absolute).
     pub fn path_of(&self, idx: NodeIdx) -> String {
         let mut parts = Vec::new();

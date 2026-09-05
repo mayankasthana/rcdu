@@ -14,7 +14,6 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crossbeam_channel::TryRecvError;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use app::{App, KeyAction};
@@ -141,7 +140,8 @@ KEYS:
     j/k, down/up    move          l/Enter/right   enter directory
     h/Backspace     go up         /               filter by name (Enter, Esc cancel)
     s               toggle sort   t               largest files under this dir
-    a               apparent/disk d               delete (confirm; needs full scan)
+    a               apparent/disk r               rescan selected dir in place
+    d               delete (confirm; needs full scan)
     o               open          ?               help
     q/Esc           quit",
         env!("CARGO_PKG_VERSION")
@@ -191,12 +191,12 @@ fn main() {
 
     // --- Interactive scan mode. ---
     let (tree, root, opts) = prepare_scan(&args);
-    let scan = scan::start(root, opts);
+    let scan = scan::start(root, opts.clone());
     let mut app = App::new(tree, args.disk_usage, args.read_only, true);
-    app.attach_scan(scan.control);
+    app.attach_scan(scan, opts);
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, &mut app, &scan.events);
+    let result = run(&mut terminal, &mut app);
     ratatui::restore();
 
     if let Err(e) = result {
@@ -312,10 +312,7 @@ fn write_export(tree: &Tree, dest: &str) -> std::io::Result<()> {
 
 fn run_ui(app: &mut App) {
     let mut terminal = ratatui::init();
-    // No scanner channel in import mode: feed an already-disconnected receiver.
-    let (_tx, rx) = crossbeam_channel::bounded::<scan::Batch>(0);
-    drop(_tx);
-    let result = run(&mut terminal, app, &rx);
+    let result = run(&mut terminal, app);
     ratatui::restore();
     if let Err(e) = result {
         eprintln!("rcdu: {e}");
@@ -323,37 +320,14 @@ fn run_ui(app: &mut App) {
     }
 }
 
-fn run(
-    terminal: &mut ratatui::DefaultTerminal,
-    app: &mut App,
-    events: &crossbeam_channel::Receiver<scan::Batch>,
-) -> std::io::Result<()> {
+fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Result<()> {
     loop {
-        // Drain whatever the scanner produced since the last frame. Cap the batch so a huge
-        // filesystem can't starve input handling between redraws.
-        let mut applied = 0;
-        loop {
-            match events.try_recv() {
-                Ok(batch) => {
-                    app.apply(batch);
-                    applied += 1;
-                    if applied >= 20_000 {
-                        break;
-                    }
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    if app.scanning {
-                        app.scanning = false;
-                        // No more batches will arrive — free the scan-only bookkeeping.
-                        app.tree.finish_scan();
-                    }
-                    break;
-                }
-            }
-        }
+        // Drain whatever the scanners produced since the last frame. `poll_scans` caps the
+        // batch so a huge filesystem can't starve input handling between redraws, and folds
+        // stream completion (initial scan, subtree rescans) into the app state.
+        app.poll_scans(20_000);
 
-        // Fold in the result of any background deletion.
+        // Fold in the result of any background deletion / system open.
         app.poll_delete();
         app.poll_open();
 
@@ -406,6 +380,7 @@ fn decode_key(code: KeyCode, mods: KeyModifiers, searching: bool) -> Option<KeyA
         KeyCode::Char('d') => KeyAction::Delete,
         KeyCode::Char('o') => KeyAction::Open,
         KeyCode::Char('t') => KeyAction::TopFiles,
+        KeyCode::Char('r') => KeyAction::Refresh,
         KeyCode::Char('/') => KeyAction::Search,
         KeyCode::Char('y') | KeyCode::Char('Y') => KeyAction::Confirm,
         KeyCode::Char('n') | KeyCode::Char('N') => KeyAction::Cancel,

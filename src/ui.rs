@@ -176,11 +176,19 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
             }
         };
 
-        // The subtree being deleted is locked: show a spinner and dim it.
+        // The subtree being deleted is locked: show a spinner and dim it. A subtree being
+        // rescanned shows a spinner too, but stays styled normally (it's readable, not locked).
         let (name_style, suffix) = if app.deleting_idx() == Some(k) {
             (
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 format!("  [{} deleting…]", SPINNER[app.tick % SPINNER.len()]),
+            )
+        } else if app.refreshing_idx == Some(k) {
+            (
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+                format!("  [{} rescanning…]", SPINNER[app.tick % SPINNER.len()]),
             )
         } else {
             let suffix = match n.excluded {
@@ -304,6 +312,16 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             app.tree.total_dirs, app.tree.total_files
         )
     };
+    // An in-place rescan is worth surfacing even after the initial scan finished.
+    let status = if let Some(idx) = app.refreshing_idx {
+        format!(
+            "{status}  {} rescanning {}…",
+            SPINNER[app.tick % SPINNER.len()],
+            app.tree.nodes[idx].name
+        )
+    } else {
+        status
+    };
     let sort = match app.sort {
         SortKey::Size => "size",
         SortKey::Name => "name",
@@ -366,6 +384,7 @@ fn render_help(f: &mut Frame) {
         Line::from("  d                 delete selected (confirm; needs full scan)"),
         Line::from("  o                 open selected in default app / file manager"),
         Line::from("  t                 largest files under this directory"),
+        Line::from("  r                 rescan selected directory in place"),
         Line::from("  ?                 toggle this help"),
         Line::from("  q / Esc / Ctrl-C  quit (during a delete: press twice to abort it)"),
         Line::from(""),
