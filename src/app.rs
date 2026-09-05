@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use crossbeam_channel::{unbounded, Receiver};
 
 use crate::model::{NodeIdx, NodeKind, Tree};
-use crate::scan::{Batch, ScanControl};
+use crate::scan::{start_at, Batch, Opts, Scan, ScanControl, SCAN_ID_STRIDE};
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum SortKey {
@@ -58,6 +58,14 @@ struct PendingOpen {
     rx: Receiver<std::io::Result<()>>,
 }
 
+/// One live batch stream: the original scan (`refresh: false`) or a subtree rescan
+/// (`refresh: true`). `alive` flips false once the stream's channel disconnects.
+struct ScanHandle {
+    rx: Receiver<Batch>,
+    refresh: bool,
+    alive: bool,
+}
+
 pub struct App {
     pub tree: Tree,
     /// Directory currently being viewed.
@@ -87,15 +95,28 @@ pub struct App {
     pending_open: Vec<PendingOpen>,
     /// True once the user has pressed quit during a deletion; a second press force-quits.
     quit_armed: bool,
-    /// Handle to steer the live scan (prioritize the focused directory). None when browsing a
-    /// loaded dump (`-f`), where there is no scan.
-    scan_control: Option<ScanControl>,
+    /// Batch streams of every live scan: the original one plus any subtree rescans.
+    scans: Vec<ScanHandle>,
+    /// Steering handles for every live scan; navigation re-prioritizes each one.
+    controls: Vec<ScanControl>,
+    /// Scan options, kept so a subtree rescan can reuse them (same threads, excludes, `-x`).
+    /// None when browsing a loaded dump (`-f`), where there is nothing to rescan.
+    scan_opts: Option<Opts>,
+    /// The subtree currently being rescanned in place, if any.
+    pub refreshing_idx: Option<NodeIdx>,
+    /// Generation counter for subtree rescans; each gets a disjoint scanner-id range.
+    next_scan_base: u64,
     /// Spinner animation frame.
     pub tick: usize,
 }
 
 impl App {
     pub fn new(tree: Tree, disk_usage: bool, read_only: bool, scanning: bool) -> Self {
+        let mut tree = tree;
+        if !scanning {
+            // An imported dump arrives complete: release the scan-only bookkeeping up front.
+            tree.finish_scan();
+        }
         App {
             cur: tree.root,
             selected: None,
@@ -112,25 +133,76 @@ impl App {
             pending_delete: None,
             pending_open: Vec::new(),
             quit_armed: false,
-            scan_control: None,
+            scans: Vec::new(),
+            controls: Vec::new(),
+            scan_opts: None,
+            refreshing_idx: None,
+            next_scan_base: 1,
             tick: 0,
             tree,
         }
     }
 
-    /// Attach the live-scan steering handle (interactive scan mode only).
-    pub fn attach_scan(&mut self, control: ScanControl) {
-        self.scan_control = Some(control);
+    /// Attach the initial scan: its batch stream, its steering handle, and the options future
+    /// subtree rescans should reuse (interactive scan mode only).
+    pub fn attach_scan(&mut self, scan: Scan, opts: Opts) {
+        self.scans.push(ScanHandle {
+            rx: scan.events,
+            refresh: false,
+            alive: true,
+        });
+        self.controls.push(scan.control);
+        self.scan_opts = Some(opts);
         self.refocus();
     }
 
-    /// Tell the scanner to prioritize the directory currently being viewed.
+    /// Tell every live scan to prioritize the directory currently being viewed.
     fn refocus(&mut self) {
         if !self.scanning {
             return;
         }
-        if let Some(ctrl) = &self.scan_control {
-            ctrl.set_focus(Some(PathBuf::from(self.tree.path_of(self.cur))));
+        let focus = Some(PathBuf::from(self.tree.path_of(self.cur)));
+        for ctrl in &self.controls {
+            ctrl.set_focus(focus.clone());
+        }
+    }
+
+    /// Drain every live scan's batch stream into the tree (up to `cap` batches per frame, so a
+    /// huge filesystem can't starve input handling). Marks streams dead when their channel
+    /// disconnects; when a rescan's stream ends the spinner clears, and when the last stream
+    /// ends the scan is over and the scan-only bookkeeping is released.
+    pub fn poll_scans(&mut self, cap: usize) {
+        let mut applied = 0usize;
+        for i in 0..self.scans.len() {
+            if !self.scans[i].alive {
+                continue;
+            }
+            loop {
+                match self.scans[i].rx.try_recv() {
+                    Ok(batch) => {
+                        self.tree.apply(batch);
+                        applied += 1;
+                        if applied >= cap {
+                            break;
+                        }
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        self.scans[i].alive = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if self.refreshing_idx.is_some() && !self.scans.iter().any(|h| h.alive && h.refresh) {
+            let idx = self.refreshing_idx.take().unwrap();
+            self.status = Some(format!("rescanned {}", self.tree.path_of(idx)));
+        }
+        let any_alive = self.scans.iter().any(|h| h.alive);
+        if self.scanning && !any_alive {
+            self.scanning = false;
+            self.tree.finish_scan();
         }
     }
 
@@ -138,8 +210,62 @@ impl App {
         self.pending_delete.is_some()
     }
 
-    pub fn apply(&mut self, batch: Batch) {
-        self.tree.apply(batch);
+    /// True if a deletion in progress covers `sel` (the node itself or an ancestor of it).
+    fn deletion_covers(&self, sel: NodeIdx) -> bool {
+        self.deleting_idx().is_some_and(|d| {
+            let mut cur = Some(sel);
+            while let Some(i) = cur {
+                if i == d {
+                    return true;
+                }
+                cur = self.tree.nodes[i].parent;
+            }
+            false
+        })
+    }
+
+    /// Rescan the selected directory in place: the model tears its subtree down and a new
+    /// scanner generation re-reads it from disk, grafting back into the same node. Browsing
+    /// stays live the whole time; totals of surrounding directories stay correct throughout.
+    fn request_refresh(&mut self) {
+        let Some(sel) = self.selected else { return };
+        let Some(opts) = self.scan_opts.as_ref() else {
+            self.status = Some("rescan unavailable: browsing an imported dump".into());
+            return;
+        };
+        if self.refreshing_idx.is_some() {
+            self.status = Some("a rescan is already in progress — please wait".into());
+            return;
+        }
+        if !self.tree.nodes[sel].is_dir() {
+            self.status = Some("select a directory to rescan".into());
+            return;
+        }
+        // Scanning a subtree that is being removed from disk would race the deletion.
+        if self.deletion_covers(sel) {
+            self.status = Some("can't rescan: a deletion is in progress here".into());
+            return;
+        }
+        // The subtree must be fully known before tearing it down — otherwise the original
+        // scan could still deliver batches for it and double-count.
+        if !self.tree.subtree_complete(sel) {
+            self.status = Some("cannot rescan: directory is still being scanned".into());
+            return;
+        }
+        let id_base = self.next_scan_base * SCAN_ID_STRIDE;
+        self.next_scan_base += 1;
+        let path = self.tree.path_of(sel);
+        self.tree.begin_refresh(sel, id_base);
+        let scan = start_at(PathBuf::from(&path), opts.clone(), id_base);
+        self.scans.push(ScanHandle {
+            rx: scan.events,
+            refresh: true,
+            alive: true,
+        });
+        self.controls.push(scan.control);
+        self.refreshing_idx = Some(sel);
+        self.scanning = true;
+        self.status = Some(format!("rescanning {path}…"));
     }
 
     /// The aggregated size metric we currently sort and display by.
@@ -378,6 +504,7 @@ impl App {
             KeyAction::Delete => self.request_delete(),
             KeyAction::Open => self.open_selected(),
             KeyAction::TopFiles => self.open_top_files(),
+            KeyAction::Refresh => self.request_refresh(),
             KeyAction::Confirm | KeyAction::Cancel => {}
             // Handled by the search-mode block above; unreachable here.
             KeyAction::FilterChar(_)
@@ -642,6 +769,7 @@ pub enum KeyAction {
     FilterConfirm,
     FilterCancel,
     TopFiles,
+    Refresh,
 }
 
 /// Case-insensitive substring test used by the `/` filter. ASCII letters compare
