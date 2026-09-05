@@ -3,6 +3,7 @@
 //! Selection tracks a node's *identity*, not its row position, so the highlight stays glued to
 //! the same entry even as live size updates reshuffle the sort order during a scan.
 
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Instant;
@@ -43,6 +44,8 @@ pub enum Modal {
     ConfirmDelete(NodeIdx),
     /// The largest files under the directory the popup was opened from.
     TopFiles(Box<TopFiles>),
+    /// Details of the selected entry (tree data plus a fresh on-disk stat).
+    Info(NodeIdx),
 }
 
 /// An in-progress deletion running on a background thread, so the UI stays responsive and shows
@@ -391,6 +394,87 @@ impl App {
         out
     }
 
+    /// Open the info popup for the selected entry.
+    fn open_info(&mut self) {
+        if let Some(sel) = self.selected {
+            self.modal = Modal::Info(sel);
+        }
+    }
+
+    /// Rows for the info popup: tree data plus a lazily-statted on-disk section. The stat is
+    /// taken at open time and nothing is stored in the node, keeping the tree lean; if the
+    /// path is gone (deleted mid-session, or a dump whose paths no longer exist) only the
+    /// tree data is shown.
+    pub fn info_pairs(&self, idx: NodeIdx) -> Vec<(String, String)> {
+        use crate::ui::fmt_size;
+        let n = &self.tree.nodes[idx];
+        let kind_name = match n.kind {
+            NodeKind::Dir => "directory",
+            NodeKind::File => "file",
+            NodeKind::Link => "symlink",
+            NodeKind::Other => "special",
+        };
+        let mut rows = vec![
+            ("path".to_string(), self.tree.path_of(idx)),
+            ("type".to_string(), kind_name.to_string()),
+            (
+                "total size".to_string(),
+                fmt_size(self.size_of(idx)).trim_start().to_string(),
+            ),
+            (
+                "own size".to_string(),
+                fmt_size(self.own_size_of(idx)).trim_start().to_string(),
+            ),
+        ];
+        if n.is_dir() {
+            rows.push(("entries".to_string(), n.children.len().to_string()));
+        }
+        if n.hlink {
+            rows.push(("hard links".to_string(), "yes".to_string()));
+        }
+        if n.shared {
+            rows.push((
+                "duplicate".to_string(),
+                "hard link already counted elsewhere".to_string(),
+            ));
+        }
+        match n.excluded {
+            Excluded::Pattern => {
+                rows.push((
+                    "excluded".to_string(),
+                    "matched --exclude pattern".to_string(),
+                ));
+            }
+            Excluded::OtherFs => {
+                rows.push((
+                    "excluded".to_string(),
+                    "different filesystem (-x)".to_string(),
+                ));
+            }
+            Excluded::No => {}
+        }
+        if n.read_error {
+            rows.push(("read error".to_string(), "yes".to_string()));
+        }
+        match std::fs::symlink_metadata(self.tree.path_of(idx)) {
+            Ok(m) => {
+                rows.push((
+                    "permissions".to_string(),
+                    format!("{:o}", m.mode() & 0o7777),
+                ));
+                rows.push(("owner".to_string(), format!("{}:{}", m.uid(), m.gid())));
+                rows.push(("modified".to_string(), fmt_time(m.mtime())));
+                rows.push(("inode".to_string(), m.ino().to_string()));
+                rows.push(("links".to_string(), m.nlink().to_string()));
+            }
+            Err(_) => rows.push((
+                "on disk".to_string(),
+                "unavailable (deleted since scanning, or dump paths are gone)".to_string(),
+            )),
+        }
+        rows
+    }
+
     /// The node currently being deleted (its subtree is locked), if any.
     pub fn deleting_idx(&self) -> Option<NodeIdx> {
         self.pending_delete.as_ref().map(|p| p.idx)
@@ -444,6 +528,9 @@ impl App {
                 }
                 return;
             }
+            // Any key closes the info popup (it's read-only), including q — which must not
+            // also quit, so it returns before the quit handling below.
+            Modal::Info(_) => return,
             Modal::None => {}
         }
 
@@ -537,6 +624,7 @@ impl App {
             KeyAction::Open => self.open_selected(),
             KeyAction::TopFiles => self.open_top_files(),
             KeyAction::Refresh => self.request_refresh(),
+            KeyAction::Info => self.open_info(),
             KeyAction::Confirm | KeyAction::Cancel => {}
             // Handled by the search-mode block above; unreachable here.
             KeyAction::FilterChar(_)
@@ -804,9 +892,38 @@ pub enum KeyAction {
     FilterCancel,
     TopFiles,
     Refresh,
+    Info,
     /// Jump by this many rows (the visible page height).
     PageDown(usize),
     PageUp(usize),
+}
+
+/// Split Unix seconds into UTC civil date/time (Howard Hinnant's civil-from-days).
+fn civil(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (h, mi, s) = (
+        (tod / 3600) as u32,
+        ((tod % 3600) / 60) as u32,
+        (tod % 60) as u32,
+    );
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m as u32, d as u32, h, mi, s)
+}
+
+/// Human-readable UTC timestamp for the info panel (mtime), dependency-free.
+pub fn fmt_time(secs: i64) -> String {
+    let (y, mo, d, h, mi, s) = civil(secs);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC")
 }
 
 /// Case-insensitive substring test used by the `/` filter. ASCII letters compare
@@ -1085,5 +1202,93 @@ mod tests {
 
         app.scanning = false;
         assert_eq!(app.scan_rate(), None);
+    }
+
+    /// The info popup's timestamps (dependency-free UTC formatting, leap days included).
+    #[test]
+    fn fmt_time_formats_utc() {
+        assert_eq!(fmt_time(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(fmt_time(86_400), "1970-01-02 00:00:00 UTC");
+        assert_eq!(fmt_time(951_782_400), "2000-02-29 00:00:00 UTC");
+        assert_eq!(fmt_time(1_000_000_000), "2001-09-09 01:46:40 UTC");
+        assert_eq!(fmt_time(1_700_000_000), "2023-11-14 22:13:20 UTC");
+    }
+
+    /// With no matching on-disk file (tree paths under "/r" don't exist here), the popup shows
+    /// tree data and degrades gracefully instead of failing.
+    #[test]
+    fn info_rows_show_tree_data_and_note_missing_disk_entry() {
+        let app = app_with_entries();
+        let beta = app.tree.nodes[app.tree.root].children[1];
+        let rows = app.info_pairs(beta);
+        assert!(rows.contains(&("path".to_string(), "/r/Beta".to_string())));
+        assert!(rows.contains(&("type".to_string(), "file".to_string())));
+        let on_disk = rows
+            .iter()
+            .find(|(k, _)| k == "on disk")
+            .expect("on-disk row present");
+        assert!(on_disk.1.starts_with("unavailable"), "got {on_disk:?}");
+    }
+
+    /// For a live file, the on-disk section is statted: octal permissions, owner uid:gid, and
+    /// a formatted modification time.
+    #[test]
+    fn info_rows_stat_live_files() {
+        use std::fs;
+        let base = std::env::temp_dir().join(format!("rcdu_info_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("f"), b"0123456789").unwrap();
+        let meta = fs::symlink_metadata(&base).unwrap();
+        let mut t = Tree::new(
+            base.to_string_lossy().into(),
+            meta.len(),
+            meta.blocks() * 512,
+            meta.dev(),
+            meta.ino(),
+        );
+        let f = t.import_child(
+            t.root,
+            "f".into(),
+            NodeKind::File,
+            10,
+            4096,
+            meta.dev(),
+            1,
+            false,
+            false,
+            Excluded::No,
+            false,
+        );
+        let app = App::new(t, true, false, false);
+        let rows = app.info_pairs(f);
+
+        let perms = rows.iter().find(|(k, _)| k == "permissions").unwrap();
+        assert!(i64::from_str_radix(&perms.1, 8).is_ok(), "got {perms:?}");
+        let owner = rows.iter().find(|(k, _)| k == "owner").unwrap();
+        assert!(owner.1.contains(':'), "got {owner:?}");
+        let modified = rows.iter().find(|(k, _)| k == "modified").unwrap();
+        assert_eq!(
+            modified.1.len(),
+            23,
+            "YYYY-MM-DD HH:MM:SS UTC: {modified:?}"
+        );
+        assert!(
+            rows.iter().all(|(k, _)| k != "entries" && k != "on disk"),
+            "no dir-only or error rows for a live file"
+        );
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The info popup is read-only: any key closes it, and q must not quit through it.
+    #[test]
+    fn info_modal_closes_on_any_key_without_quitting() {
+        let mut app = app_with_entries();
+        app.on_key(KeyAction::Info);
+        assert!(matches!(app.modal, Modal::Info(_)));
+        app.on_key(KeyAction::Quit);
+        assert!(matches!(app.modal, Modal::None));
+        assert!(!app.quit, "closing info must not quit");
     }
 }
