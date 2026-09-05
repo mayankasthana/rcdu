@@ -89,6 +89,7 @@ rcdu -f old.json -o new.json    # re-read and rewrite a dump (recomputes totals/
 | `r` | rescan the selected directory in place |
 | `i` | show details of the selected entry |
 | `e` | export the tree to an ncdu-format JSON file |
+| `x` | jump to the next read-error entry (`!` marker), wrapping around |
 | `o` | open selected entry (default app; directories in the file manager) |
 | `?` | show the help dialog |
 | `q` / `Esc` | quit |

@@ -425,6 +425,7 @@ fn render_help(f: &mut Frame) {
         Line::from("  i                 show details of the selected entry"),
         Line::from("  r                 rescan selected directory in place"),
         Line::from("  e                 export the tree to an ncdu-format JSON file"),
+        Line::from("  x / !             jump to the next read-error entry"),
         Line::from("  ?                 toggle this help"),
         Line::from("  q / Esc / Ctrl-C  quit (during a delete: press twice to abort it)"),
         Line::from(""),
