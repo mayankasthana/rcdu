@@ -87,6 +87,7 @@ rcdu -f old.json -o new.json    # re-read and rewrite a dump (recomputes totals/
 | `d` | delete selected entry (asks to confirm) |
 | `t` | show the largest files under the current directory |
 | `r` | rescan the selected directory in place |
+| `i` | show details of the selected entry |
 | `o` | open selected entry (default app; directories in the file manager) |
 | `?` | show the help dialog |
 | `q` / `Esc` | quit |
@@ -123,6 +124,15 @@ apply: the directory must have finished scanning, only one rescan runs at a time
 directory being deleted cannot be rescanned. One limitation: hard links that cross the rescan
 boundary (one link inside, another outside the rescanned subtree) are each counted, so totals
 can slightly overcount until a full restart.
+
+### Entry details
+
+Press `i` on the selected entry to see its path, type, total and own sizes, the number of
+entries for directories, and flags (hard links, exclusions, read errors) — plus, statted
+lazily from disk at open time, its permissions, numeric owner, modification time, inode, and
+link count. Nothing extra is stored per node, so the tree stays lean; if the path is gone
+(deleted mid-session, or a dump whose paths no longer exist) the on-disk section is simply
+omitted.
 
 ### Deleting
 

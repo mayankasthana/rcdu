@@ -57,8 +57,41 @@ pub fn render(f: &mut Frame, app: &App) {
         Modal::Help => render_help(f),
         Modal::ConfirmDelete(idx) => render_confirm(f, app, *idx),
         Modal::TopFiles(tf) => render_top_files(f, app, tf),
+        Modal::Info(idx) => render_info(f, app, *idx),
         Modal::None => {}
     }
+}
+
+/// The info popup: tree data plus a fresh on-disk stat of the selected entry, label/value
+/// rows. Read-only; any key closes it.
+fn render_info(f: &mut Frame, app: &App, idx: usize) {
+    let rows = app.info_pairs(idx);
+    let mut lines: Vec<Line> = rows
+        .iter()
+        .map(|(k, v)| {
+            Line::from(vec![
+                Span::styled(format!("  {k:<12} "), Style::default().fg(Color::Cyan)),
+                Span::raw(v.as_str()),
+            ])
+        })
+        .collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  press any key to close",
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    )));
+    let width = 74u16;
+    let height = wrapped_height(&lines, width - 2) + 2;
+    let area = popup(f.area(), width, height);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(" Info ")),
+        area,
+    );
 }
 
 /// The top-files popup: largest regular files under the viewed directory, one row each, with
@@ -389,6 +422,7 @@ fn render_help(f: &mut Frame) {
         Line::from("  d                 delete selected (confirm; needs full scan)"),
         Line::from("  o                 open selected in default app / file manager"),
         Line::from("  t                 largest files under this directory"),
+        Line::from("  i                 show details of the selected entry"),
         Line::from("  r                 rescan selected directory in place"),
         Line::from("  ?                 toggle this help"),
         Line::from("  q / Esc / Ctrl-C  quit (during a delete: press twice to abort it)"),
