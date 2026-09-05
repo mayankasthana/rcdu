@@ -40,6 +40,8 @@ pub enum Excluded {
     Pattern,
     /// On a different filesystem and `-x` was given.
     OtherFs,
+    /// Outside the `--older-than`/`--newer-than` mtime window.
+    Age,
 }
 
 pub struct Node {

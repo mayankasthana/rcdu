@@ -539,6 +539,12 @@ impl App {
                     "different filesystem (-x)".to_string(),
                 ));
             }
+            Excluded::Age => {
+                rows.push((
+                    "excluded".to_string(),
+                    "outside --older-than/--newer-than window".to_string(),
+                ));
+            }
             Excluded::No => {}
         }
         if n.read_error {

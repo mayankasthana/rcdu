@@ -75,6 +75,7 @@ fn write_item<W: Write>(tree: &Tree, idx: NodeIdx, w: &mut W) -> io::Result<()> 
     match n.excluded {
         Excluded::Pattern => write!(w, ",\"excluded\":\"pattern\"")?,
         Excluded::OtherFs => write!(w, ",\"excluded\":\"otherfs\"")?,
+        Excluded::Age => write!(w, ",\"excluded\":\"age\"")?,
         Excluded::No => {}
     }
     w.write_all(b"}")
@@ -157,6 +158,7 @@ fn parse_item(v: &Value) -> Item {
         read_error: g("read_error").and_then(Value::as_bool).unwrap_or(false),
         excluded: match g("excluded").and_then(Value::as_str) {
             Some("otherfs") => Excluded::OtherFs,
+            Some("age") => Excluded::Age,
             Some(_) => Excluded::Pattern,
             None => Excluded::No,
         },
