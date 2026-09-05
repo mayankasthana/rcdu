@@ -90,11 +90,19 @@ rcdu -f old.json -o new.json    # re-read and rewrite a dump (recomputes totals/
 | `i` | show details of the selected entry |
 | `e` | export the tree to an ncdu-format JSON file |
 | `x` | jump to the next read-error entry (`!` marker), wrapping around |
+| `b` | spawn `$SHELL` in the selected directory (its parent, for a file) |
 | `o` | open selected entry (default app; directories in the file manager) |
 | `?` | show the help dialog |
 | `q` / `Esc` | quit |
 
 Row indicators: `/` dir · `@` symlink · `H` hard-link duplicate · `<` excluded · `!` read error.
+
+### Shelling out
+
+Press `b` to suspend the TUI and run `$SHELL` interactively in the selected directory (for a
+file, the directory containing it) — find it here, fix it there, `exit` to come straight back
+into rcdu. The scan keeps running in the background while you're away and catches up when you
+return.
 
 By default sizes are **on-disk usage** (`st_blocks × 512`); press `a` for apparent size.
 Symlinks are never followed (counted as the link itself), matching ncdu's default.

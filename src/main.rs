@@ -12,6 +12,7 @@ mod update;
 use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -143,8 +144,9 @@ KEYS:
     t               top files     r               rescan selected dir
     a               apparent/disk d               delete (confirm; full scan)
     o               open          i               entry details
-    e               export JSON   x / !           next read error
-    g/G, Home/End   top/bottom    ?               help    q/Esc  quit",
+    e               export JSON   b               shell here
+    x / !           next error    ?               help    q/Esc  quit
+    g/G, Home/End   top/bottom",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -332,6 +334,17 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
         app.poll_delete();
         app.poll_open();
 
+        // A requested shell: fully tear down the TUI, hand the tty to the user's shell in the
+        // target directory, and rebuild the UI when it exits. The scan keeps running in the
+        // background; its events buffer until we're back.
+        if let Some(dir) = app.take_shell_request() {
+            app.status = run_shell(terminal, &dir);
+            // Swallow any keys typed at the moment the shell exited.
+            while event::poll(Duration::from_millis(0))? {
+                let _ = event::read();
+            }
+        }
+
         terminal.draw(|f| ui::render(f, app))?;
 
         // Poll faster while scanning or deleting so updates/spinners animate smoothly.
@@ -358,6 +371,24 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
             return Ok(());
         }
     }
+}
+
+/// Suspend the TUI, run `$SHELL` interactively in `dir`, and rebuild the UI when it exits.
+/// Returns a status line describing the outcome. This is the documented ratatui pattern for
+/// handing the terminal to a child process; the child gets the real tty, keystrokes and all.
+fn run_shell(terminal: &mut ratatui::DefaultTerminal, dir: &str) -> Option<String> {
+    let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty());
+    let Some(shell) = shell else {
+        return Some("no SHELL set — cannot spawn a shell".into());
+    };
+    ratatui::restore();
+    let outcome = match Command::new(&shell).current_dir(dir).status() {
+        Ok(status) if status.success() => format!("shell exited (was in {dir})"),
+        Ok(status) => format!("shell exited with {status}"),
+        Err(e) => format!("shell failed: {e}"),
+    };
+    *terminal = ratatui::init();
+    Some(outcome)
 }
 
 fn decode_key(
@@ -401,6 +432,7 @@ fn decode_key(
         KeyCode::Char('i') => KeyAction::Info,
         KeyCode::Char('e') => KeyAction::Export,
         KeyCode::Char('x') | KeyCode::Char('!') => KeyAction::NextError,
+        KeyCode::Char('b') => KeyAction::Shell,
         KeyCode::Char('/') => KeyAction::Search,
         KeyCode::Char('y') | KeyCode::Char('Y') => KeyAction::Confirm,
         KeyCode::Char('n') | KeyCode::Char('N') => KeyAction::Cancel,
