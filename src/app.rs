@@ -481,6 +481,8 @@ impl App {
             }
             KeyAction::Down => self.move_selection(&kids, 1),
             KeyAction::Up => self.move_selection(&kids, -1),
+            KeyAction::PageDown(page) => self.move_selection(&kids, page as isize),
+            KeyAction::PageUp(page) => self.move_selection(&kids, -(page as isize)),
             KeyAction::Top => self.selected = kids.first().copied(),
             KeyAction::Bottom => self.selected = kids.last().copied(),
             KeyAction::Enter => self.descend(),
@@ -514,6 +516,8 @@ impl App {
         }
     }
 
+    /// Move the selection by `delta` rows, clamped to the list. `delta` is the page size for
+    /// the page keys and ±1 for plain up/down.
     fn move_selection(&mut self, kids: &[NodeIdx], delta: isize) {
         if kids.is_empty() {
             return;
@@ -770,6 +774,9 @@ pub enum KeyAction {
     FilterCancel,
     TopFiles,
     Refresh,
+    /// Jump by this many rows (the visible page height).
+    PageDown(usize),
+    PageUp(usize),
 }
 
 /// Case-insensitive substring test used by the `/` filter. ASCII letters compare
@@ -1017,5 +1024,20 @@ mod tests {
         a.poll_open();
         assert_eq!(a.status.as_deref(), Some("opened /r/a"));
         assert!(a.pending_open.is_empty());
+    }
+
+    /// PageUp/PageDown jump by the given page size and clamp at the ends.
+    #[test]
+    fn page_keys_jump_and_clamp() {
+        let mut app = app_with_entries();
+        // Sorted by size: Beta(30), banner(20), alpha(10), gamma(5).
+        app.on_key(KeyAction::PageDown(2));
+        assert_eq!(app.tree.nodes[app.selected.unwrap()].name, "alpha");
+        app.on_key(KeyAction::PageDown(99));
+        assert_eq!(app.tree.nodes[app.selected.unwrap()].name, "gamma");
+        app.on_key(KeyAction::PageUp(2));
+        assert_eq!(app.tree.nodes[app.selected.unwrap()].name, "banner");
+        app.on_key(KeyAction::PageUp(99));
+        assert_eq!(app.tree.nodes[app.selected.unwrap()].name, "Beta");
     }
 }

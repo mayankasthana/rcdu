@@ -378,6 +378,7 @@ fn render_help(f: &mut Frame) {
         Line::from("  l / Enter / →     enter directory"),
         Line::from("  h / Backspace / ← go up"),
         Line::from("  g / G             jump to top / bottom"),
+        Line::from("  PgUp / PgDn, C-d / C-u  page up / down"),
         Line::from("  s                 toggle sort (size ↔ name)"),
         Line::from("  /                 filter entries by name (Enter applies, Esc cancels)"),
         Line::from("  a                 toggle apparent ↔ disk usage"),
