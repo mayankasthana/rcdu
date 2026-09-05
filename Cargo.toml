@@ -1,6 +1,6 @@
 [package]
 name = "rcdu"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "An ncdu-like disk usage explorer that is interactive while it scans, optimized for SSDs"
 license = "MIT"
