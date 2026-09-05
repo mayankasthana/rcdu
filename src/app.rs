@@ -115,6 +115,9 @@ pub struct App {
     bytes_seen: u64,
     /// When the current scan generation started; None until a scan is attached.
     scan_started: Option<Instant>,
+    /// A pending request to suspend the TUI and spawn `$SHELL` in this directory, consumed
+    /// once per frame by the event loop (which owns the terminal).
+    shell_request: Option<String>,
     /// Spinner animation frame.
     pub tick: usize,
 }
@@ -149,6 +152,7 @@ impl App {
             next_scan_base: 1,
             bytes_seen: 0,
             scan_started: None,
+            shell_request: None,
             tick: 0,
             tree,
         }
@@ -404,6 +408,24 @@ impl App {
             return;
         }
         self.status = Some("no read errors".into());
+    }
+
+    /// Request a shell in the selected directory (or, for a file/symlink, the directory
+    /// containing it). The event loop owns the terminal, so it consumes the request and
+    /// handles the suspend/resume; nothing happens here but recording it.
+    fn request_shell(&mut self) {
+        let idx = self.selected.unwrap_or(self.cur);
+        let target = if self.tree.nodes[idx].is_dir() {
+            idx
+        } else {
+            self.cur
+        };
+        self.shell_request = Some(self.tree.path_of(target));
+    }
+
+    /// Consume a pending shell request, if any.
+    pub fn take_shell_request(&mut self) -> Option<String> {
+        self.shell_request.take()
     }
 
     fn ensure_selection(&mut self, kids: &[NodeIdx]) {
@@ -693,6 +715,7 @@ impl App {
             KeyAction::Info => self.open_info(),
             KeyAction::Export => self.request_export(),
             KeyAction::NextError => self.jump_to_next_error(),
+            KeyAction::Shell => self.request_shell(),
             KeyAction::Confirm | KeyAction::Cancel => {}
             // Handled by the search-mode block above; unreachable here.
             KeyAction::FilterChar(_)
@@ -966,6 +989,7 @@ pub enum KeyAction {
     PageUp(usize),
     Export,
     NextError,
+    Shell,
 }
 
 /// First free `rcdu-dump*.json` path in `dir`, so consecutive exports never clobber each
@@ -1471,5 +1495,26 @@ mod tests {
         app.on_key(KeyAction::NextError);
         assert_eq!(app.selected, before);
         assert_eq!(app.status.as_deref(), Some("no read errors"));
+    }
+
+    /// `b` targets the selected directory, or — for a file — the directory containing it.
+    #[test]
+    fn shell_request_targets_selected_dir_or_parent_of_file() {
+        let mut app = app_with_entries();
+        // No selection yet: falls back to the current directory.
+        app.on_key(KeyAction::Shell);
+        assert_eq!(app.take_shell_request().as_deref(), Some("/r"));
+
+        // "alpha" (two downs from Beta) is a file: the shell goes to its parent, not the file.
+        app.on_key(KeyAction::Down);
+        app.on_key(KeyAction::Down);
+        app.on_key(KeyAction::Shell);
+        assert_eq!(app.take_shell_request().as_deref(), Some("/r"));
+
+        // "gamma" is a directory: the shell opens there.
+        app.on_key(KeyAction::Down);
+        app.on_key(KeyAction::Shell);
+        assert_eq!(app.take_shell_request().as_deref(), Some("/r/gamma"));
+        assert!(app.take_shell_request().is_none(), "request is consumed");
     }
 }
