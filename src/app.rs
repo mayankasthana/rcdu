@@ -5,10 +5,11 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::Instant;
 
 use crossbeam_channel::{unbounded, Receiver};
 
-use crate::model::{NodeIdx, NodeKind, Tree};
+use crate::model::{Excluded, NodeIdx, NodeKind, Tree};
 use crate::scan::{start_at, Batch, Opts, Scan, ScanControl, SCAN_ID_STRIDE};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -106,6 +107,10 @@ pub struct App {
     pub refreshing_idx: Option<NodeIdx>,
     /// Generation counter for subtree rescans; each gets a disjoint scanner-id range.
     next_scan_base: u64,
+    /// Counted bytes grafted by live scans, for the footer's throughput display.
+    bytes_seen: u64,
+    /// When the current scan generation started; None until a scan is attached.
+    scan_started: Option<Instant>,
     /// Spinner animation frame.
     pub tick: usize,
 }
@@ -138,6 +143,8 @@ impl App {
             scan_opts: None,
             refreshing_idx: None,
             next_scan_base: 1,
+            bytes_seen: 0,
+            scan_started: None,
             tick: 0,
             tree,
         }
@@ -153,6 +160,7 @@ impl App {
         });
         self.controls.push(scan.control);
         self.scan_opts = Some(opts);
+        self.scan_started = Some(Instant::now());
         self.refocus();
     }
 
@@ -180,6 +188,14 @@ impl App {
             loop {
                 match self.scans[i].rx.try_recv() {
                     Ok(batch) => {
+                        // Count the batch's counted bytes before `apply` moves it, for the
+                        // footer's throughput display.
+                        self.bytes_seen += batch
+                            .nodes
+                            .iter()
+                            .filter(|n| !n.shared && n.excluded == Excluded::No)
+                            .map(|n| n.apparent)
+                            .sum::<u64>();
                         self.tree.apply(batch);
                         applied += 1;
                         if applied >= cap {
@@ -265,7 +281,21 @@ impl App {
         self.controls.push(scan.control);
         self.refreshing_idx = Some(sel);
         self.scanning = true;
+        // A fresh generation: the throughput display reflects this rescan, not the bytes the
+        // original scan already brought in.
+        self.bytes_seen = 0;
+        self.scan_started = Some(Instant::now());
         self.status = Some(format!("rescanning {path}…"));
+    }
+
+    /// Counted bytes per second being grafted by the live scan, for the footer. None when no
+    /// scan is running; the first second reports the bytes seen so far.
+    pub fn scan_rate(&self) -> Option<u64> {
+        if !self.scanning {
+            return None;
+        }
+        let started = self.scan_started?;
+        Some(self.bytes_seen / started.elapsed().as_secs().max(1))
     }
 
     /// The aggregated size metric we currently sort and display by.
@@ -1039,5 +1069,21 @@ mod tests {
         assert_eq!(app.tree.nodes[app.selected.unwrap()].name, "banner");
         app.on_key(KeyAction::PageUp(99));
         assert_eq!(app.tree.nodes[app.selected.unwrap()].name, "Beta");
+    }
+
+    /// The footer's throughput figure: bytes/sec while a scan runs, none otherwise.
+    #[test]
+    fn scan_rate_reports_bytes_per_second_while_scanning() {
+        let mut app = app_with_entries();
+        assert_eq!(app.scan_rate(), None, "no scan attached yet");
+
+        app.scanning = true;
+        app.scan_started = Some(Instant::now());
+        app.bytes_seen = 4_000_000;
+        // Elapsed is sub-second, so the rate is the bytes seen in the first second.
+        assert_eq!(app.scan_rate(), Some(4_000_000));
+
+        app.scanning = false;
+        assert_eq!(app.scan_rate(), None);
     }
 }
