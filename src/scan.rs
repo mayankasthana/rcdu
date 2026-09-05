@@ -135,6 +135,10 @@ pub struct Opts {
     pub excludes: Vec<String>,
     /// Device id of the root, used for `one_file_system`.
     pub root_dev: u64,
+    /// `--older-than`: entries modified before this Unix time (seconds) are excluded.
+    pub older_than: Option<i64>,
+    /// `--newer-than`: entries modified after this Unix time (seconds) are excluded.
+    pub newer_than: Option<i64>,
 }
 
 /// State shared by workers only (NOT the UI), so it holds the event `Sender`.
@@ -144,6 +148,10 @@ struct Shared {
     one_file_system: bool,
     root_dev: u64,
     excludes: Vec<String>,
+    /// `--older-than` cutoff in Unix seconds; entries modified before it are excluded.
+    older_than: Option<i64>,
+    /// `--newer-than` cutoff in Unix seconds; entries modified after it are excluded.
+    newer_than: Option<i64>,
     /// (dev, ino) of hard-linked inodes already counted, so duplicates can be flagged.
     seen_hardlinks: Mutex<HashSet<(u64, u64)>>,
 }
@@ -196,6 +204,8 @@ pub fn start_at(root: PathBuf, opts: Opts, id_base: u64) -> Scan {
         one_file_system: opts.one_file_system,
         root_dev: opts.root_dev,
         excludes: opts.excludes,
+        older_than: opts.older_than,
+        newer_than: opts.newer_than,
         seen_hardlinks: Mutex::new(HashSet::new()),
     });
 
@@ -302,12 +312,15 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
         let ino = meta.ino();
         let apparent = meta.len();
         let disk = meta.blocks() * 512;
+        let mtime = meta.mtime();
         let hlink = matches!(kind, NodeKind::File) && meta.nlink() > 1;
 
         // Determine exclusion / whether to recurse.
         let mut excluded = Excluded::No;
         if name_excluded(&name, &shared.excludes) {
             excluded = Excluded::Pattern;
+        } else if age_excluded(mtime, shared) {
+            excluded = Excluded::Age;
         } else if shared.one_file_system && matches!(kind, NodeKind::Dir) && dev != shared.root_dev
         {
             excluded = Excluded::OtherFs;
@@ -374,6 +387,23 @@ fn name_excluded(name: &str, patterns: &[String]) -> bool {
     patterns.iter().any(|p| glob::matches(p, name))
 }
 
+/// Outside the `--older-than`/`--newer-than` window: `older_than` excludes entries modified
+/// before its cutoff, `newer_than` excludes entries modified after it. Both flag the entry
+/// like `--exclude` (visible, not descended into, not counted).
+fn age_excluded(mtime: i64, shared: &Shared) -> bool {
+    if let Some(cutoff) = shared.older_than {
+        if mtime < cutoff {
+            return true;
+        }
+    }
+    if let Some(cutoff) = shared.newer_than {
+        if mtime > cutoff {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +416,8 @@ mod tests {
             one_file_system: false,
             excludes: Vec::new(),
             root_dev,
+            older_than: None,
+            newer_than: None,
         }
     }
 
@@ -731,6 +763,98 @@ mod tests {
         );
         assert_eq!(tree.total_files, fresh.total_files);
         assert_eq!(tree.total_dirs, fresh.total_dirs);
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// `--older-than` / `--newer-than` exclude entries by mtime: filtered entries stay
+    /// visible but are not descended into and don't count toward totals.
+    #[test]
+    fn age_filters_exclude_entries_at_scan_time() {
+        use std::time::{Duration, SystemTime};
+
+        let base = std::env::temp_dir().join(format!("rcdu_age_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("olddir")).unwrap();
+        fs::write(base.join("oldfile"), vec![b'x'; 1000]).unwrap();
+        fs::write(base.join("newfile"), vec![b'x'; 2000]).unwrap();
+        fs::write(base.join("olddir/inner"), vec![b'x'; 4000]).unwrap();
+
+        // Age the old entries: 2000-01-01, well before any cutoff below. futimens works
+        // through a read-only fd, which is also the only way to open a directory.
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(946_684_800);
+        for path in ["oldfile", "olddir", "olddir/inner"] {
+            fs::File::open(base.join(path))
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+        let meta = fs::symlink_metadata(&base).unwrap();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let cutoff = now - 100 * 86_400; // 100 days ago
+
+        let mut tree = Tree::new(
+            "root".into(),
+            meta.len(),
+            meta.blocks() * 512,
+            meta.dev(),
+            meta.ino(),
+        );
+        let mut o = opts(4, meta.dev());
+        o.older_than = Some(cutoff);
+        let rx = start(base.clone(), o).events;
+        for batch in rx.iter() {
+            tree.apply(batch);
+        }
+        assert!(tree.orphans_is_empty());
+
+        let find = |name: &str| {
+            tree.nodes[tree.root]
+                .children
+                .iter()
+                .find(|&&c| tree.nodes[c].name == name)
+                .copied()
+                .unwrap_or_else(|| panic!("{name} present"))
+        };
+        let old_file = find("oldfile");
+        let new_file = find("newfile");
+        let old_dir = find("olddir");
+        assert_eq!(tree.nodes[old_file].excluded, Excluded::Age);
+        assert_eq!(tree.nodes[new_file].excluded, Excluded::No);
+        assert_eq!(tree.nodes[old_dir].excluded, Excluded::Age);
+        // The old directory was not descended into, so its inner file never entered the tree.
+        assert!(tree.nodes[old_dir].children.is_empty());
+        // Only the fresh file's bytes count toward the root total.
+        assert_eq!(tree.nodes[tree.root].apparent, 2000 + meta.len());
+
+        // And the mirror: --newer-than keeps the old entries and excludes the fresh ones.
+        let mut tree = Tree::new(
+            "root".into(),
+            meta.len(),
+            meta.blocks() * 512,
+            meta.dev(),
+            meta.ino(),
+        );
+        let mut o = opts(4, meta.dev());
+        o.newer_than = Some(cutoff);
+        let rx = start(base.clone(), o).events;
+        for batch in rx.iter() {
+            tree.apply(batch);
+        }
+        let find = |name: &str| {
+            tree.nodes[tree.root]
+                .children
+                .iter()
+                .find(|&&c| tree.nodes[c].name == name)
+                .copied()
+                .unwrap()
+        };
+        assert_eq!(tree.nodes[find("oldfile")].excluded, Excluded::No);
+        assert_eq!(tree.nodes[find("newfile")].excluded, Excluded::Age);
+        assert_eq!(tree.nodes[find("olddir")].excluded, Excluded::No);
 
         fs::remove_dir_all(&base).unwrap();
     }

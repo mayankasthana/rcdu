@@ -227,6 +227,7 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
             let suffix = match n.excluded {
                 Excluded::OtherFs => "  <other filesystem>".to_string(),
                 Excluded::Pattern => "  <excluded>".to_string(),
+                Excluded::Age => "  <mtime filter>".to_string(),
                 Excluded::No => String::new(),
             };
             (name_style, suffix)

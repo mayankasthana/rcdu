@@ -28,6 +28,10 @@ struct Args {
     one_file_system: bool,
     read_only: bool,
     excludes: Vec<String>,
+    /// `--older-than DUR`: exclude entries not modified for this long (seconds).
+    older_than: Option<u64>,
+    /// `--newer-than DUR`: exclude entries modified within this window (seconds).
+    newer_than: Option<u64>,
     /// `-o FILE`: scan headless and write ncdu JSON, then exit. `-` means stdout.
     export: Option<String>,
     /// `-f FILE`: load a tree from ncdu JSON instead of scanning. `-` means stdin.
@@ -41,6 +45,8 @@ fn parse_args() -> Result<Args, String> {
     let mut one_file_system = false;
     let mut read_only = false;
     let mut excludes = Vec::new();
+    let mut older_than = None;
+    let mut newer_than = None;
     let mut export = None;
     let mut import = None;
 
@@ -67,6 +73,16 @@ fn parse_args() -> Result<Args, String> {
             "-r" | "--read-only" => read_only = true,
             "--exclude" => {
                 excludes.push(it.next().ok_or("--exclude needs a pattern")?);
+            }
+            "--older-than" => {
+                let d = it
+                    .next()
+                    .ok_or("--older-than needs a duration (e.g. 30d)")?;
+                older_than = Some(parse_duration(&d)?);
+            }
+            "--newer-than" => {
+                let d = it.next().ok_or("--newer-than needs a duration (e.g. 1y)")?;
+                newer_than = Some(parse_duration(&d)?);
             }
             "-X" | "--exclude-from" => {
                 let file = it.next().ok_or("--exclude-from needs a file")?;
@@ -105,9 +121,32 @@ fn parse_args() -> Result<Args, String> {
         one_file_system,
         read_only,
         excludes,
+        older_than,
+        newer_than,
         export,
         import,
     })
+}
+
+/// Parse a human duration like `45s`, `30m`, `12h`, `30d`, `2w`, `1y`. A bare number is days.
+fn parse_duration(s: &str) -> Result<u64, String> {
+    let (num, unit_secs) = match s.chars().last() {
+        Some(c) if c.is_ascii_digit() => (s, 86_400u64),
+        Some('s') => (&s[..s.len() - 1], 1),
+        Some('m') => (&s[..s.len() - 1], 60),
+        Some('h') => (&s[..s.len() - 1], 3_600),
+        Some('d') => (&s[..s.len() - 1], 86_400),
+        Some('w') => (&s[..s.len() - 1], 604_800),
+        Some('y') => (&s[..s.len() - 1], 31_536_000),
+        _ => {
+            return Err(format!(
+                "invalid duration '{s}' (expected e.g. 45s, 30m, 12h, 30d, 2w, 1y)"
+            ))
+        }
+    };
+    let n: u64 = num.parse().map_err(|_| format!("invalid duration '{s}'"))?;
+    n.checked_mul(unit_secs)
+        .ok_or_else(|| format!("duration '{s}' overflows"))
 }
 
 fn print_help() {
@@ -126,6 +165,8 @@ OPTIONS:
     -a, --apparent-size      show apparent size instead of on-disk usage
     -x, --one-file-system    do not cross filesystem boundaries
         --exclude PATTERN    exclude entries matching a glob (repeatable)
+        --older-than DUR     exclude entries older than DUR (e.g. 30d, 2w, 1y)
+        --newer-than DUR     exclude entries newer than DUR (surfaces stale data)
     -X, --exclude-from FILE  read exclude patterns from FILE (one per line)
     -r, --read-only          disable the delete feature
     -o, --output FILE        scan without UI and write ncdu-compatible JSON ('-' = stdout)
@@ -250,11 +291,18 @@ fn prepare_scan(args: &Args) -> (Tree, PathBuf, Opts) {
         meta.dev(),
         meta.ino(),
     );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     let opts = Opts {
         threads: args.threads,
         one_file_system: args.one_file_system,
         excludes: args.excludes.clone(),
         root_dev: meta.dev(),
+        // Precompute the mtime cutoffs once, at scan start.
+        older_than: args.older_than.map(|d| now - d as i64),
+        newer_than: args.newer_than.map(|d| now - d as i64),
     };
     (tree, root, opts)
 }
@@ -445,7 +493,7 @@ fn decode_key(
 mod tests {
     use std::path::Path;
 
-    use super::plain_path;
+    use super::{parse_duration, plain_path};
 
     #[test]
     fn verbatim_roots_reduce_to_plain_paths() {
@@ -461,5 +509,23 @@ mod tests {
             plain_path(Path::new(r"\\?\.\PhysicalDrive0")),
             r"\\?\.\PhysicalDrive0"
         );
+    }
+
+    #[test]
+    fn parse_duration_understands_units() {
+        assert_eq!(parse_duration("45s").unwrap(), 45);
+        assert_eq!(parse_duration("30m").unwrap(), 1_800);
+        assert_eq!(parse_duration("12h").unwrap(), 43_200);
+        assert_eq!(parse_duration("30d").unwrap(), 2_592_000);
+        assert_eq!(parse_duration("2w").unwrap(), 1_209_600);
+        assert_eq!(parse_duration("1y").unwrap(), 31_536_000);
+        assert_eq!(
+            parse_duration("10").unwrap(),
+            864_000,
+            "bare numbers are days"
+        );
+        assert!(parse_duration("abc").is_err());
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("1x").is_err());
     }
 }

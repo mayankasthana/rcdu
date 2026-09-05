@@ -53,6 +53,8 @@ OPTIONS:
     -a, --apparent-size      show apparent size (st_size) instead of on-disk usage
     -x, --one-file-system    do not cross filesystem boundaries
         --exclude PATTERN    exclude entries matching a glob (repeatable)
+        --older-than DUR     exclude entries older than DUR (e.g. 30d, 2w, 1y)
+        --newer-than DUR     exclude entries newer than DUR (surfaces stale data)
     -X, --exclude-from FILE  read exclude patterns from FILE (one per line)
     -r, --read-only          disable the delete feature
     -o, --output FILE        scan without UI and write ncdu-compatible JSON ('-' = stdout)
@@ -173,6 +175,10 @@ results (`remove_dir_all` can't be cleanly cancelled). Any other key disarms the
   Excluded entries stay visible (marked `<`) but are not descended into and don't count.
 - `-x` keeps the scan on the root's filesystem; mount points on other devices are shown but not
   traversed.
+- `--older-than DUR` / `--newer-than DUR` exclude entries by modification time (durations:
+  `s`/`m`/`h`/`d`/`w`/`y`, bare numbers = days). Filtered entries stay visible (marked
+  `<mtime filter>`) but are not descended into and don't count — e.g. `rcdu ~ --newer-than 1y`
+  surfaces the data you haven't touched in a year.
 
 ### ncdu JSON compatibility
 
