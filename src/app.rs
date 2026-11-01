@@ -604,10 +604,7 @@ impl App {
                         let idx = tf.items[tf.selected].idx;
                         // The tree may have changed since the popup opened (deletions and
                         // rescans tombstone nodes): only jump if the entry is still attached.
-                        let live = self.tree.nodes[idx]
-                            .parent
-                            .is_some_and(|p| self.tree.nodes[p].children.contains(&idx));
-                        if live {
+                        if self.tree.is_attached(idx) {
                             self.cur = self.tree.nodes[idx].parent.unwrap();
                             self.selected = Some(idx);
                             self.refocus();

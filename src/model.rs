@@ -89,6 +89,9 @@ pub struct Tree {
     orphans: HashMap<u64, Vec<Batch>>,
     pub total_files: u64,
     pub total_dirs: u64,
+    /// How many times a subtree has been detached (deleted or torn down for a rescan). While
+    /// this is 0 every node is attached, so callers can skip [`Tree::is_attached`].
+    pub detached: u64,
 }
 
 impl Tree {
@@ -120,6 +123,7 @@ impl Tree {
             orphans: HashMap::new(),
             total_dirs: 1,
             total_files: 0,
+            detached: 0,
         }
     }
 
@@ -289,6 +293,9 @@ impl Tree {
                 self.sub_size(parent, ap, dk);
             }
         }
+        // Cut the upward link too, so `is_attached` can tell the tombstones apart.
+        self.nodes[idx].parent = None;
+        self.detached += 1;
         // Walk the subtree to update global counts (nodes become unreachable tombstones).
         let mut dirs = 0u64;
         let mut files = 0u64;
@@ -318,6 +325,11 @@ impl Tree {
         let (own_apparent, own_disk) = (self.own_apparent(idx), self.own_disk(idx));
 
         let mut stack = std::mem::take(&mut self.nodes[idx].children);
+        // Cut the children's upward links, so `is_attached` can tell the tombstones apart.
+        for &c in &stack {
+            self.nodes[c].parent = None;
+        }
+        self.detached += 1;
         let mut dirs = 0u64;
         let mut files = 0u64;
         while let Some(n) = stack.pop() {
@@ -349,6 +361,16 @@ impl Tree {
             self.sub_size(parent, removed_apparent, removed_disk);
         }
         self.dir_index.insert(id_base, idx);
+    }
+
+    /// True if `idx` is still part of the tree: its parent chain reaches the root. Deleted and
+    /// rescanned-away nodes stay in `nodes` as tombstones, but their chain ends early.
+    pub fn is_attached(&self, idx: NodeIdx) -> bool {
+        let mut cur = idx;
+        while let Some(p) = self.nodes[cur].parent {
+            cur = p;
+        }
+        cur == self.root
     }
 
     /// Build a filesystem path for a node, walking back to the root (whose name is absolute).
@@ -491,5 +513,67 @@ mod tests {
         assert!(t.subtree_complete(t.nodes[a].children[0]), "b complete");
         assert!(t.subtree_complete(a), "a complete");
         assert!(t.subtree_complete(t.root), "root complete");
+    }
+
+    fn file(name: &str, ino: u64) -> NewNode {
+        NewNode {
+            kind: NodeKind::File,
+            dir_id: None,
+            ..dir(name, ino)
+        }
+    }
+
+    /// Root with `a/` (containing `a/x`, `a/sub/`, `a/sub/y`) and a sibling file `b`.
+    fn small_tree() -> Tree {
+        let mut t = Tree::new("/r".into(), 100, 100, 1, 1);
+        t.apply(Batch {
+            parent_id: 0,
+            nodes: vec![dir("a", 1), file("b", 10)],
+            error: None,
+        });
+        t.apply(Batch {
+            parent_id: 1,
+            nodes: vec![file("x", 11), dir("sub", 2)],
+            error: None,
+        });
+        t.apply(Batch {
+            parent_id: 2,
+            nodes: vec![file("y", 12)],
+            error: None,
+        });
+        t
+    }
+
+    fn idx_of(t: &Tree, name: &str) -> NodeIdx {
+        t.nodes.iter().position(|n| n.name == name).unwrap()
+    }
+
+    /// Deleting a subtree turns every node in it into a detectable tombstone.
+    #[test]
+    fn deleted_subtree_is_detached() {
+        let mut t = small_tree();
+        assert_eq!(t.detached, 0);
+        assert!((0..t.nodes.len()).all(|i| t.is_attached(i)));
+
+        t.delete_subtree(idx_of(&t, "a"));
+        assert_eq!(t.detached, 1);
+        for gone in ["a", "x", "sub", "y"] {
+            assert!(!t.is_attached(idx_of(&t, gone)), "{gone} is a tombstone");
+        }
+        assert!(t.is_attached(idx_of(&t, "b")), "sibling stays");
+        assert!(t.is_attached(t.root));
+    }
+
+    /// A rescan tears down the subtree below the refreshed directory, which itself stays.
+    #[test]
+    fn refreshed_subtree_is_detached_but_its_root_stays() {
+        let mut t = small_tree();
+        t.begin_refresh(idx_of(&t, "a"), 1 << 40);
+        assert_eq!(t.detached, 1);
+        assert!(t.is_attached(idx_of(&t, "a")));
+        assert!(t.is_attached(idx_of(&t, "b")));
+        for gone in ["x", "sub", "y"] {
+            assert!(!t.is_attached(idx_of(&t, gone)), "{gone} is a tombstone");
+        }
     }
 }
