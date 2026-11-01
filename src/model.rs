@@ -373,6 +373,22 @@ impl Tree {
         cur == self.root
     }
 
+    /// The path of a node relative to the root (`sub/dir/file`), for compact display. Empty
+    /// for the root itself.
+    pub fn rel_path_of(&self, idx: NodeIdx) -> String {
+        let mut parts = Vec::new();
+        let mut cur = idx;
+        while cur != self.root {
+            parts.push(self.nodes[cur].name.as_str());
+            match self.nodes[cur].parent {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        parts.reverse();
+        parts.join("/")
+    }
+
     /// Build a filesystem path for a node, walking back to the root (whose name is absolute).
     pub fn path_of(&self, idx: NodeIdx) -> String {
         let mut parts = Vec::new();
