@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{indicator, App, Modal, SortKey, TopFiles};
+use crate::app::{find_ci, indicator, App, Find, Modal, SortKey, TopFiles, FIND_CAP};
 use crate::model::{Excluded, NodeKind};
 
 const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
@@ -58,6 +58,7 @@ pub fn render(f: &mut Frame, app: &App) {
         Modal::ConfirmDelete(idx) => render_confirm(f, app, *idx),
         Modal::TopFiles(tf) => render_top_files(f, app, tf),
         Modal::Info(idx) => render_info(f, app, *idx),
+        Modal::Find(find) => render_find(f, app, find),
         Modal::None => {}
     }
 }
@@ -141,6 +142,166 @@ fn render_top_files(f: &mut Frame, app: &App, tf: &TopFiles) {
         Paragraph::new(Line::from(Span::styled(
             format!(" j/k move · Enter go to file · q close   (sizes: {metric})"),
             Style::default().fg(Color::DarkGray),
+        ))),
+        hint_area,
+    );
+}
+
+/// `1234567` → `1,234,567`, for match counts.
+fn fmt_count(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Where to cut `path` so it fits in `width` columns when shown as `…` + the rest: the byte
+/// index the shown tail starts at, 0 if the whole path fits. The cut is moved forward to the
+/// next `/` when there is one, so the tail reads `…/deep/dir/name` and the name (where the
+/// match is) stays visible.
+fn truncate_left(path: &str, width: usize) -> usize {
+    let len = path.chars().count();
+    if len <= width {
+        return 0;
+    }
+    // Keep the last `width - 1` chars; one column goes to the ellipsis.
+    let skip = len - width.saturating_sub(1);
+    let start = path.char_indices().nth(skip).map_or(path.len(), |(i, _)| i);
+    match path[start..].find('/') {
+        Some(rel) => start + rel,
+        None => start,
+    }
+}
+
+/// The whole-tree search popup: the query line, one row per hit (path relative to the scan
+/// root, size, the matched part of the name highlighted), and the match count and progress
+/// of the running pass in the title. Paths are only built for the rows on screen.
+fn render_find(f: &mut Frame, app: &App, find: &Find) {
+    let width = f.area().width.saturating_sub(4).clamp(28, 120);
+    let height = f.area().height.saturating_sub(2).max(7);
+    let area = popup(f.area(), width, height);
+    f.render_widget(Clear, area);
+
+    let busy = find.busy(&app.tree);
+    let progress = if busy {
+        let pct = find.cursor as f64 / app.tree.nodes.len().max(1) as f64 * 100.0;
+        format!(" · searching… {pct:.0}%")
+    } else {
+        String::new()
+    };
+    let title = if find.active.is_none() {
+        " Search the whole tree ".to_string()
+    } else if find.capped() {
+        let hint = if busy { "" } else { " — refine the query" };
+        format!(
+            " {}+ matches{progress}{hint} ",
+            fmt_count(FIND_CAP.min(find.hits.len()))
+        )
+    } else {
+        let s = if find.total == 1 { "" } else { "es" };
+        format!(" {} match{s}{progress} ", fmt_count(find.total))
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let [input_area, list_area, hint_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " find ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" {}▌", find.query)),
+        ])),
+        input_area,
+    );
+
+    let dim = Style::default().fg(Color::DarkGray);
+    if find.hits.is_empty() {
+        let msg = match &find.active {
+            None if find.query.is_empty() => "  type to search entry names across the whole tree",
+            Some(q) if *q == find.query && !busy => "  no matches",
+            _ => "",
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(msg, dim))),
+            list_area,
+        );
+    } else {
+        let rows = (list_area.height as usize).max(1);
+        let pos = find.selected_pos().unwrap_or(0);
+        let offset = pos.saturating_sub(rows - 1);
+        let q = find.active.as_deref().unwrap_or("");
+        // Size column (10 + 2 spaces) and the rest for the path.
+        let path_width = (list_area.width as usize).saturating_sub(12).max(8);
+        let mark = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+
+        let items: Vec<ListItem> = find.hits[offset..(offset + rows).min(find.hits.len())]
+            .iter()
+            .map(|&idx| {
+                let n = &app.tree.nodes[idx];
+                let mut path = app.tree.rel_path_of(idx);
+                // The name is the path's last component; locate the match inside it.
+                let name_start = path.len() - n.name.len();
+                let hit = find_ci(&n.name, q).map(|m| (name_start + m, name_start + m + q.len()));
+                if n.is_dir() {
+                    path.push('/');
+                }
+                let cut = truncate_left(&path, path_width);
+                let mut spans = vec![Span::styled(
+                    format!("{:>10}  ", fmt_size(app.size_of(idx))),
+                    Style::default().fg(Color::Green),
+                )];
+                if cut > 0 {
+                    spans.push(Span::styled("…", dim));
+                }
+                match hit {
+                    Some((a, b)) if a >= cut => {
+                        spans.push(Span::raw(path[cut..a].to_string()));
+                        spans.push(Span::styled(path[a..b].to_string(), mark));
+                        spans.push(Span::raw(path[b..].to_string()));
+                    }
+                    // No match found (can't happen for a live hit) or cut off: plain path.
+                    _ => spans.push(Span::raw(path[cut..].to_string())),
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+        let mut state = ListState::default();
+        state.select(find.selected_pos().map(|p| p - offset));
+        f.render_stateful_widget(
+            List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
+            list_area,
+            &mut state,
+        );
+    }
+
+    let metric = if app.disk_usage {
+        "disk usage"
+    } else {
+        "apparent size"
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" ↑/↓ PgUp/PgDn move · Enter go to entry · Esc close   (sizes: {metric})"),
+            dim,
         ))),
         hint_area,
     );
@@ -419,6 +580,7 @@ fn render_help(f: &mut Frame) {
         Line::from("  PgUp / PgDn, C-d / C-u  page up / down"),
         Line::from("  s                 toggle sort (size ↔ name)"),
         Line::from("  /                 filter entries by name (Enter applies, Esc cancels)"),
+        Line::from("  f                 search the whole tree by name (Enter goes there)"),
         Line::from("  a                 toggle apparent ↔ disk usage"),
         Line::from("  d                 delete selected (confirm; needs full scan)"),
         Line::from("  o                 open selected in default app / file manager"),
@@ -496,4 +658,35 @@ fn render_confirm(f: &mut Frame, app: &App, idx: usize) {
         ),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fmt_count, truncate_left};
+
+    #[test]
+    fn fmt_count_groups_thousands() {
+        assert_eq!(fmt_count(0), "0");
+        assert_eq!(fmt_count(999), "999");
+        assert_eq!(fmt_count(1_000), "1,000");
+        assert_eq!(fmt_count(1_234_567), "1,234,567");
+    }
+
+    /// Long paths lose their head, cut at a `/` so the tail (and the name) stays readable.
+    #[test]
+    fn truncate_left_keeps_the_tail() {
+        assert_eq!(truncate_left("a/b/c.txt", 20), 0, "fits: no cut");
+        let p = "very/long/prefix/deep/dir/match.txt";
+        let cut = truncate_left(p, 20);
+        assert_eq!(&p[cut..], "/deep/dir/match.txt");
+        assert!(p[cut..].chars().count() < 20, "tail plus the ellipsis fits");
+        // No `/` in the kept tail: cut mid-name, still within the width.
+        let cut = truncate_left("x/averyveryverylongname", 10);
+        assert_eq!(&"x/averyveryverylongname"[cut..], "ylongname");
+        // Multi-byte names never cut inside a char.
+        let p = "äöü/ßßßßßßßß/ëëë";
+        let cut = truncate_left(p, 6);
+        assert!(p.is_char_boundary(cut));
+        assert_eq!(&p[cut..], "/ëëë");
+    }
 }

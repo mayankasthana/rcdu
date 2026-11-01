@@ -13,11 +13,11 @@ use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
-use app::{App, KeyAction};
+use app::{App, InputMode, KeyAction};
 use model::Tree;
 use scan::Opts;
 
@@ -181,9 +181,10 @@ COMMANDS:
 KEYS:
     j/k, down/up    move          l/Enter/right   enter directory
     h/Backspace     go up         PgUp/PgDn,C-d/u page
-    /               filter names  s               toggle sort
-    t               top files     r               rescan selected dir
-    a               apparent/disk d               delete (confirm; full scan)
+    /               filter names  f               search whole tree
+    s               toggle sort   t               top files
+    r               rescan dir    a               apparent/disk
+    d               delete (confirm; full scan)
     o               open          i               entry details
     e               export JSON   b               shell here
     x / !           next error    ?               help    q/Esc  quit
@@ -371,12 +372,20 @@ fn run_ui(app: &mut App) {
     }
 }
 
+/// Nodes the whole-tree search looks at per frame: a few milliseconds of work, so input stays
+/// responsive while a pass over a 10M-entry tree finishes in well under a second.
+const FIND_SLICE: usize = 200_000;
+
 fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Result<()> {
     loop {
         // Drain whatever the scanners produced since the last frame. `poll_scans` caps the
         // batch so a huge filesystem can't starve input handling between redraws, and folds
         // stream completion (initial scan, subtree rescans) into the app state.
         app.poll_scans(20_000);
+
+        // Advance the whole-tree search (if its popup is open) by one slice, right after the
+        // new batches landed so live matches show up this frame.
+        app.find_tick(Instant::now(), FIND_SLICE);
 
         // Fold in the result of any background deletion / system open.
         app.poll_delete();
@@ -395,9 +404,16 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
 
         terminal.draw(|f| ui::render(f, app))?;
 
-        // Poll faster while scanning or deleting so updates/spinners animate smoothly.
+        // Poll faster while scanning or deleting so updates/spinners animate smoothly. While a
+        // search pass has work left, don't wait at all (input is still checked every slice),
+        // and wake up in time for a debounced search query.
         let busy = app.scanning || app.is_deleting();
-        let timeout = Duration::from_millis(if busy { 80 } else { 250 });
+        let mut timeout = Duration::from_millis(if busy { 80 } else { 250 });
+        if app.find_busy() {
+            timeout = Duration::ZERO;
+        } else if let Some(due) = app.find_due() {
+            timeout = timeout.min(due.saturating_duration_since(Instant::now()));
+        }
         if event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
@@ -407,7 +423,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
                         .size()
                         .map(|s| (s.height.saturating_sub(5) as usize).max(1))
                         .unwrap_or(20);
-                    if let Some(action) = decode_key(key.code, key.modifiers, app.searching, page) {
+                    if let Some(action) =
+                        decode_key(key.code, key.modifiers, app.input_mode(), page)
+                    {
                         app.on_key(action);
                     }
                 }
@@ -442,14 +460,30 @@ fn run_shell(terminal: &mut ratatui::DefaultTerminal, dir: &str) -> Option<Strin
 fn decode_key(
     code: KeyCode,
     mods: KeyModifiers,
-    searching: bool,
+    mode: InputMode,
     page: usize,
 ) -> Option<KeyAction> {
-    // Ctrl-C quits even while a filter is being typed.
+    // Ctrl-C quits even while a filter or search query is being typed.
     if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
         return Some(KeyAction::Quit);
     }
-    if searching {
+    // The search popup: letters go to the query, so only non-letter keys navigate.
+    if mode == InputMode::Find {
+        return Some(match code {
+            KeyCode::Char(c) => KeyAction::FindChar(c),
+            KeyCode::Backspace => KeyAction::FindBackspace,
+            KeyCode::Down => KeyAction::Down,
+            KeyCode::Up => KeyAction::Up,
+            KeyCode::PageDown => KeyAction::PageDown(page),
+            KeyCode::PageUp => KeyAction::PageUp(page),
+            KeyCode::Home => KeyAction::Top,
+            KeyCode::End => KeyAction::Bottom,
+            KeyCode::Enter => KeyAction::Enter,
+            KeyCode::Esc => KeyAction::Cancel,
+            _ => return None,
+        });
+    }
+    if mode == InputMode::Filter {
         return Some(match code {
             KeyCode::Char(c) => KeyAction::FilterChar(c),
             KeyCode::Backspace => KeyAction::FilterBackspace,
@@ -482,6 +516,7 @@ fn decode_key(
         KeyCode::Char('x') | KeyCode::Char('!') => KeyAction::NextError,
         KeyCode::Char('b') => KeyAction::Shell,
         KeyCode::Char('/') => KeyAction::Search,
+        KeyCode::Char('f') => KeyAction::Find,
         KeyCode::Char('y') | KeyCode::Char('Y') => KeyAction::Confirm,
         KeyCode::Char('n') | KeyCode::Char('N') => KeyAction::Cancel,
         KeyCode::Char('?') => KeyAction::Help,
@@ -493,7 +528,10 @@ fn decode_key(
 mod tests {
     use std::path::Path;
 
-    use super::{parse_duration, plain_path};
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+
+    use super::{decode_key, parse_duration, plain_path};
+    use crate::app::{InputMode, KeyAction};
 
     #[test]
     fn verbatim_roots_reduce_to_plain_paths() {
@@ -509,6 +547,53 @@ mod tests {
             plain_path(Path::new(r"\\?\.\PhysicalDrive0")),
             r"\\?\.\PhysicalDrive0"
         );
+    }
+
+    /// `f` opens the search; inside it letters (even `q`, `j`) go to the query, arrows still
+    /// navigate, Esc cancels and Ctrl-C still quits.
+    #[test]
+    fn decode_key_routes_find_mode() {
+        let none = KeyModifiers::NONE;
+        let dec = |code, mode| decode_key(code, none, mode, 10);
+        assert!(matches!(
+            dec(KeyCode::Char('f'), InputMode::Normal),
+            Some(KeyAction::Find)
+        ));
+        for c in ['q', 'j', 'f', '/'] {
+            assert!(
+                matches!(dec(KeyCode::Char(c), InputMode::Find), Some(KeyAction::FindChar(x)) if x == c),
+                "{c} goes to the query"
+            );
+        }
+        assert!(matches!(
+            dec(KeyCode::Down, InputMode::Find),
+            Some(KeyAction::Down)
+        ));
+        assert!(matches!(
+            dec(KeyCode::PageUp, InputMode::Find),
+            Some(KeyAction::PageUp(10))
+        ));
+        assert!(matches!(
+            dec(KeyCode::Enter, InputMode::Find),
+            Some(KeyAction::Enter)
+        ));
+        assert!(matches!(
+            dec(KeyCode::Esc, InputMode::Find),
+            Some(KeyAction::Cancel)
+        ));
+        assert!(matches!(
+            dec(KeyCode::Backspace, InputMode::Find),
+            Some(KeyAction::FindBackspace)
+        ));
+        assert!(matches!(
+            decode_key(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+                InputMode::Find,
+                10
+            ),
+            Some(KeyAction::Quit)
+        ));
     }
 
     #[test]

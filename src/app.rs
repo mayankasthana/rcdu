@@ -7,7 +7,7 @@ use std::io::{BufWriter, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{unbounded, Receiver};
 
@@ -37,6 +37,184 @@ pub struct TopFiles {
 /// How many rows the top-files popup shows.
 const TOP_FILES_LIMIT: usize = 100;
 
+/// How long the whole-tree search waits after the last keystroke before it runs.
+pub const FIND_DEBOUNCE: Duration = Duration::from_millis(100);
+/// The most hits the whole-tree search keeps. Broad queries (`e`) can match half the tree;
+/// past the cap, matches are only counted, and the popup asks for a narrower query.
+pub const FIND_CAP: usize = 10_000;
+/// The shortest interval between re-sorts of the hit list while it grows or sizes change.
+const FIND_RESORT: Duration = Duration::from_millis(250);
+
+/// State of the whole-tree search popup (`f`).
+///
+/// The search is one linear pass over `tree.nodes`, sliced across frames by a cursor so a huge
+/// tree never blocks the UI. Nodes are only ever appended, so the same cursor also picks up
+/// entries that a running scan or rescan adds later: live results need no special case.
+pub struct Find {
+    /// The query being typed.
+    pub query: String,
+    /// The query was edited since the last tick; the next tick (re)arms the debounce.
+    edited: bool,
+    /// When the debounced query is due to run.
+    due: Option<Instant>,
+    /// The query the current pass matches against; None while nothing is searched.
+    pub active: Option<String>,
+    /// Next node the pass will look at.
+    pub cursor: NodeIdx,
+    /// Matching nodes (at most `FIND_CAP`), sorted for display.
+    pub hits: Vec<NodeIdx>,
+    /// Every match found, including those past the cap.
+    pub total: usize,
+    /// Highlighted hit, by identity, so re-sorts and live inserts don't move the highlight.
+    pub selected: Option<NodeIdx>,
+    sort_dirty: bool,
+    last_sort: Option<Instant>,
+}
+
+impl Find {
+    fn new() -> Self {
+        Find {
+            query: String::new(),
+            edited: false,
+            due: None,
+            active: None,
+            cursor: 0,
+            hits: Vec::new(),
+            total: 0,
+            selected: None,
+            sort_dirty: false,
+            last_sort: None,
+        }
+    }
+
+    /// True while the pass has nodes left to look at.
+    pub fn busy(&self, tree: &Tree) -> bool {
+        self.active.is_some() && self.cursor < tree.nodes.len()
+    }
+
+    /// True once more matches were found than the list keeps.
+    pub fn capped(&self) -> bool {
+        self.total > self.hits.len()
+    }
+
+    /// Start a fresh pass over the whole tree for the active query.
+    fn restart(&mut self) {
+        self.cursor = 0;
+        self.hits.clear();
+        self.total = 0;
+        self.selected = None;
+        self.sort_dirty = false;
+    }
+
+    /// One frame's worth of work: debounce, then up to `budget` nodes of the pass, then a
+    /// (throttled) re-sort. `now` is passed in so tests can drive the clock.
+    fn tick(&mut self, tree: &Tree, disk_usage: bool, scanning: bool, now: Instant, budget: usize) {
+        if self.edited {
+            self.edited = false;
+            self.due = Some(now + FIND_DEBOUNCE);
+        }
+        if self.due.is_some_and(|d| now >= d) {
+            self.due = None;
+            self.active = (!self.query.is_empty()).then(|| self.query.clone());
+            self.restart();
+        }
+        let Some(q) = &self.active else { return };
+
+        let len = tree.nodes.len();
+        let was_busy = self.cursor < len;
+        let end = len.min(self.cursor.saturating_add(budget));
+        // Tombstones exist only after a delete or rescan; until then skip the parent walk.
+        let check_attached = tree.detached > 0;
+        for i in self.cursor..end {
+            if i != tree.root
+                && contains_ci(&tree.nodes[i].name, q)
+                && (!check_attached || tree.is_attached(i))
+            {
+                self.total += 1;
+                if self.hits.len() < FIND_CAP {
+                    self.hits.push(i);
+                    self.sort_dirty = true;
+                }
+            }
+        }
+        self.cursor = end;
+        let finished = was_busy && end == len;
+
+        // Sizes keep changing while a scan runs, so the order goes stale even without new hits.
+        let stale = self.sort_dirty || (scanning && !self.hits.is_empty());
+        let throttled = self
+            .last_sort
+            .is_some_and(|t| now.saturating_duration_since(t) < FIND_RESORT);
+        if stale && (finished || !throttled) {
+            let size = |i: NodeIdx| {
+                let n = &tree.nodes[i];
+                if disk_usage {
+                    n.disk
+                } else {
+                    n.apparent
+                }
+            };
+            self.hits.sort_by(|&a, &b| {
+                size(b)
+                    .cmp(&size(a))
+                    .then_with(|| tree.nodes[a].name.cmp(&tree.nodes[b].name))
+                    .then_with(|| a.cmp(&b))
+            });
+            self.sort_dirty = false;
+            self.last_sort = Some(now);
+        }
+        self.ensure_selection();
+    }
+
+    /// Drop hits that a delete or rescan turned into tombstones. Past the cap the true count
+    /// can't be corrected from the kept hits alone, so the pass starts over instead.
+    fn prune(&mut self, tree: &Tree) {
+        if self.active.is_none() {
+            return;
+        }
+        if self.capped() {
+            self.restart();
+            return;
+        }
+        let before = self.hits.len();
+        self.hits.retain(|&i| tree.is_attached(i));
+        self.total -= before - self.hits.len();
+        self.ensure_selection();
+    }
+
+    fn ensure_selection(&mut self) {
+        match self.selected {
+            Some(s) if self.hits.contains(&s) => {}
+            _ => self.selected = self.hits.first().copied(),
+        }
+    }
+
+    /// Position of the highlighted hit in the list.
+    pub fn selected_pos(&self) -> Option<usize> {
+        self.selected
+            .and_then(|s| self.hits.iter().position(|&h| h == s))
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.hits.is_empty() {
+            return;
+        }
+        let pos = self.selected_pos().unwrap_or(0) as isize;
+        let new = (pos + delta).clamp(0, self.hits.len() as isize - 1) as usize;
+        self.selected = Some(self.hits[new]);
+    }
+}
+
+/// How raw keys should be decoded right now.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InputMode {
+    Normal,
+    /// Typing the `/` filter.
+    Filter,
+    /// The whole-tree search popup is open: letters go to its query.
+    Find,
+}
+
 /// A transient modal overlay.
 pub enum Modal {
     None,
@@ -47,6 +225,8 @@ pub enum Modal {
     TopFiles(Box<TopFiles>),
     /// Details of the selected entry (tree data plus a fresh on-disk stat).
     Info(NodeIdx),
+    /// Whole-tree search by name.
+    Find(Box<Find>),
 }
 
 /// An in-progress deletion running on a background thread, so the UI stays responsive and shows
@@ -281,6 +461,7 @@ impl App {
         let path = self.tree.path_of(sel);
         self.tree.begin_refresh(sel, id_base);
         let scan = start_at(PathBuf::from(&path), opts.clone(), id_base);
+        self.prune_find();
         self.scans.push(ScanHandle {
             rx: scan.events,
             refresh: true,
@@ -574,6 +755,60 @@ impl App {
         self.pending_delete.as_ref().map(|p| p.idx)
     }
 
+    /// How the event loop should decode the next key.
+    pub fn input_mode(&self) -> InputMode {
+        if matches!(self.modal, Modal::Find(_)) {
+            InputMode::Find
+        } else if self.searching {
+            InputMode::Filter
+        } else {
+            InputMode::Normal
+        }
+    }
+
+    /// Advance the whole-tree search, if its popup is open: debounce the query, look at up to
+    /// `budget` nodes, and re-sort the hits now and then. Called once per frame, after the
+    /// scan batches are applied, so live results show up in the same frame.
+    pub fn find_tick(&mut self, now: Instant, budget: usize) {
+        if let Modal::Find(f) = &mut self.modal {
+            f.tick(&self.tree, self.disk_usage, self.scanning, now, budget);
+        }
+    }
+
+    /// True while the search pass has work left; the event loop then polls input without
+    /// waiting, so the pass finishes as fast as the slicing allows.
+    pub fn find_busy(&self) -> bool {
+        matches!(&self.modal, Modal::Find(f) if f.busy(&self.tree))
+    }
+
+    /// When the pending (debounced) search query is due, if one is waiting.
+    pub fn find_due(&self) -> Option<Instant> {
+        match &self.modal {
+            Modal::Find(f) => f.due,
+            _ => None,
+        }
+    }
+
+    /// Drop search hits that a delete or rescan just detached from the tree.
+    fn prune_find(&mut self) {
+        if let Modal::Find(f) = &mut self.modal {
+            f.prune(&self.tree);
+        }
+    }
+
+    /// Move the view to a search hit: its parent directory, with the hit selected.
+    fn jump_to_hit(&mut self, idx: NodeIdx) {
+        if !self.tree.is_attached(idx) {
+            self.status = Some("that entry is no longer in the tree".into());
+        } else if self.deletion_covers(idx) {
+            self.status = Some("can't go there: it is being deleted".into());
+        } else if let Some(parent) = self.tree.nodes[idx].parent {
+            self.cur = parent;
+            self.selected = Some(idx);
+            self.refocus();
+        }
+    }
+
     pub fn on_key(&mut self, action: KeyAction) {
         // Note: a background deletion does NOT block input — the user can keep browsing. Only
         // the subtree being deleted is locked (see `descend` and `request_delete`).
@@ -604,10 +839,7 @@ impl App {
                         let idx = tf.items[tf.selected].idx;
                         // The tree may have changed since the popup opened (deletions and
                         // rescans tombstone nodes): only jump if the entry is still attached.
-                        let live = self.tree.nodes[idx]
-                            .parent
-                            .is_some_and(|p| self.tree.nodes[p].children.contains(&idx));
-                        if live {
+                        if self.tree.is_attached(idx) {
                             self.cur = self.tree.nodes[idx].parent.unwrap();
                             self.selected = Some(idx);
                             self.refocus();
@@ -625,6 +857,63 @@ impl App {
             // Any key closes the info popup (it's read-only), including q — which must not
             // also quit, so it returns before the quit handling below.
             Modal::Info(_) => return,
+            Modal::Find(mut f) => {
+                // Whether the popup stays open after this key.
+                let keep_open = match action {
+                    KeyAction::FindChar(c) => {
+                        f.query.push(c);
+                        f.edited = true;
+                        true
+                    }
+                    KeyAction::FindBackspace => {
+                        f.query.pop();
+                        f.edited = true;
+                        true
+                    }
+                    KeyAction::Down => {
+                        f.move_selection(1);
+                        true
+                    }
+                    KeyAction::Up => {
+                        f.move_selection(-1);
+                        true
+                    }
+                    KeyAction::PageDown(page) => {
+                        f.move_selection(page as isize);
+                        true
+                    }
+                    KeyAction::PageUp(page) => {
+                        f.move_selection(-(page as isize));
+                        true
+                    }
+                    KeyAction::Top => {
+                        f.selected = f.hits.first().copied();
+                        true
+                    }
+                    KeyAction::Bottom => {
+                        f.selected = f.hits.last().copied();
+                        true
+                    }
+                    KeyAction::Enter => match f.selected {
+                        Some(idx) => {
+                            self.jump_to_hit(idx);
+                            false
+                        }
+                        // Nothing to jump to yet.
+                        None => true,
+                    },
+                    // Esc closes the popup and leaves the view as it was. Ctrl-C closes it
+                    // too and goes on to the regular quit handling below.
+                    KeyAction::Cancel | KeyAction::Quit => false,
+                    _ => true,
+                };
+                if keep_open {
+                    self.modal = Modal::Find(f);
+                }
+                if !matches!(action, KeyAction::Quit) {
+                    return;
+                }
+            }
             Modal::None => {}
         }
 
@@ -722,7 +1011,10 @@ impl App {
             KeyAction::Export => self.request_export(),
             KeyAction::NextError => self.jump_to_next_error(),
             KeyAction::Shell => self.request_shell(),
+            KeyAction::Find => self.modal = Modal::Find(Box::new(Find::new())),
             KeyAction::Confirm | KeyAction::Cancel => {}
+            // Only produced while the search popup is open, which handles them above.
+            KeyAction::FindChar(_) | KeyAction::FindBackspace => {}
             // Handled by the search-mode block above; unreachable here.
             KeyAction::FilterChar(_)
             | KeyAction::FilterBackspace
@@ -895,6 +1187,7 @@ impl App {
                 let kids = self.sorted_children();
                 let pos = kids.iter().position(|&k| k == pd.idx);
                 self.tree.delete_subtree(pd.idx);
+                self.prune_find();
                 if let Some(p) = pos {
                     let kids = self.sorted_children();
                     self.selected = (!kids.is_empty()).then(|| kids[p.min(kids.len() - 1)]);
@@ -996,6 +1289,11 @@ pub enum KeyAction {
     Export,
     NextError,
     Shell,
+    /// Open the whole-tree search popup.
+    Find,
+    /// A character typed into the search popup's query.
+    FindChar(char),
+    FindBackspace,
 }
 
 /// First free `rcdu-dump*.json` path in `dir`, so consecutive exports never clobber each
@@ -1038,16 +1336,23 @@ pub fn fmt_time(secs: i64) -> String {
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC")
 }
 
-/// Case-insensitive substring test used by the `/` filter. ASCII letters compare
-/// case-insensitively; other bytes must match exactly (a plain byte-substring test, so
-/// multi-byte UTF-8 names can't produce false positives). An empty needle matches everything,
-/// so a just-opened (still-empty) filter hides nothing.
+/// Case-insensitive substring test used by the `/` filter and the whole-tree search. ASCII
+/// letters compare case-insensitively; other bytes must match exactly (a plain byte-substring
+/// test, so multi-byte UTF-8 names can't produce false positives). An empty needle matches
+/// everything, so a just-opened (still-empty) filter hides nothing.
 fn contains_ci(haystack: &str, needle: &str) -> bool {
+    find_ci(haystack, needle).is_some()
+}
+
+/// Byte offset of the first case-insensitive match of `needle` in `haystack` (same rules as
+/// [`contains_ci`]). The match always starts and ends on a char boundary: it begins and ends
+/// with the same bytes as the (valid UTF-8) needle.
+pub fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
     let (h, n) = (haystack.as_bytes(), needle.as_bytes());
     if n.is_empty() {
-        return true;
+        return Some(0);
     }
-    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+    h.windows(n.len()).position(|w| w.eq_ignore_ascii_case(n))
 }
 
 #[cfg(test)]
@@ -1522,5 +1827,368 @@ mod tests {
         app.on_key(KeyAction::Shell);
         assert_eq!(app.take_shell_request().as_deref(), Some("/r/gamma"));
         assert!(app.take_shell_request().is_none(), "request is consumed");
+    }
+
+    // ---- Whole-tree search (`f`) ------------------------------------------------------
+
+    fn file_under(t: &mut Tree, parent: NodeIdx, name: &str, size: u64) -> NodeIdx {
+        t.import_child(
+            parent,
+            name.into(),
+            NodeKind::File,
+            size,
+            size,
+            1,
+            1,
+            false,
+            false,
+            Excluded::No,
+            false,
+        )
+    }
+
+    /// /r: docs/ { readme.md (50), sub/ { README.txt (200) } }, readme (10), other.bin (1000).
+    fn app_for_find() -> App {
+        let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        let docs = t.import_child(
+            t.root,
+            "docs".into(),
+            NodeKind::Dir,
+            0,
+            0,
+            1,
+            2,
+            false,
+            false,
+            Excluded::No,
+            false,
+        );
+        file_under(&mut t, docs, "readme.md", 50);
+        let sub = t.import_child(
+            docs,
+            "sub".into(),
+            NodeKind::Dir,
+            0,
+            0,
+            1,
+            3,
+            false,
+            false,
+            Excluded::No,
+            false,
+        );
+        file_under(&mut t, sub, "README.txt", 200);
+        file_under(&mut t, 0, "readme", 10);
+        file_under(&mut t, 0, "other.bin", 1000);
+        App::new(t, true, false, false)
+    }
+
+    fn find_state(app: &App) -> &Find {
+        match &app.modal {
+            Modal::Find(f) => f,
+            _ => panic!("search popup is not open"),
+        }
+    }
+
+    fn type_query(app: &mut App, q: &str) {
+        for c in q.chars() {
+            app.on_key(KeyAction::FindChar(c));
+        }
+    }
+
+    fn hit_names(app: &App) -> Vec<String> {
+        find_state(app)
+            .hits
+            .iter()
+            .map(|&i| app.tree.nodes[i].name.to_string())
+            .collect()
+    }
+
+    /// Open the popup, type `q`, and run the debounced pass to completion.
+    fn search(app: &mut App, q: &str) -> Instant {
+        let t0 = Instant::now();
+        app.on_key(KeyAction::Find);
+        type_query(app, q);
+        app.find_tick(t0, usize::MAX);
+        app.find_tick(t0 + FIND_DEBOUNCE, usize::MAX);
+        t0 + FIND_DEBOUNCE
+    }
+
+    fn idx_named(app: &App, name: &str) -> NodeIdx {
+        app.tree.nodes.iter().position(|n| n.name == name).unwrap()
+    }
+
+    /// Matches come from every level, case-insensitively, largest first; the root (whose
+    /// name is the absolute scan path) is never a hit.
+    #[test]
+    fn find_matches_across_whole_tree() {
+        let mut app = app_for_find();
+        search(&mut app, "readme");
+        assert_eq!(hit_names(&app), vec!["README.txt", "readme.md", "readme"]);
+        assert_eq!(find_state(&app).total, 3);
+        assert!(!app.find_busy());
+        assert_eq!(
+            find_state(&app).selected,
+            Some(idx_named(&app, "README.txt")),
+            "first hit selected"
+        );
+
+        let mut app = app_for_find();
+        search(&mut app, "/r");
+        assert!(hit_names(&app).is_empty(), "root excluded");
+    }
+
+    /// The pass runs only once the query has been left alone for the debounce interval, and
+    /// every keystroke restarts the wait.
+    #[test]
+    fn find_debounces_100ms() {
+        let mut app = app_for_find();
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        app.on_key(KeyAction::Find);
+        app.on_key(KeyAction::FindChar('r'));
+        app.find_tick(t0, usize::MAX);
+        assert_eq!(app.find_due(), Some(t0 + FIND_DEBOUNCE));
+        app.find_tick(t0 + ms(99), usize::MAX);
+        assert!(find_state(&app).active.is_none(), "too early");
+
+        // Another key at 99 ms pushes the deadline out again.
+        app.on_key(KeyAction::FindChar('e'));
+        app.find_tick(t0 + ms(99), usize::MAX);
+        app.find_tick(t0 + ms(100), usize::MAX);
+        assert!(
+            find_state(&app).active.is_none(),
+            "re-armed by the second key"
+        );
+        app.find_tick(t0 + ms(199), usize::MAX);
+        assert_eq!(find_state(&app).active.as_deref(), Some("re"));
+        assert_eq!(app.find_due(), None);
+        assert_eq!(find_state(&app).total, 3);
+
+        // Erasing the query clears the results once the debounce fires.
+        app.on_key(KeyAction::FindBackspace);
+        app.on_key(KeyAction::FindBackspace);
+        app.find_tick(t0 + ms(200), usize::MAX);
+        app.find_tick(t0 + ms(300), usize::MAX);
+        assert!(find_state(&app).active.is_none());
+        assert!(hit_names(&app).is_empty());
+    }
+
+    /// With a small budget the pass is spread over several ticks, reporting busy meanwhile.
+    #[test]
+    fn find_slices_with_budget() {
+        let mut app = app_for_find();
+        let t0 = Instant::now();
+        app.on_key(KeyAction::Find);
+        type_query(&mut app, "readme");
+        app.find_tick(t0, 0);
+        let mut now = t0 + FIND_DEBOUNCE;
+        let mut ticks = 0;
+        loop {
+            app.find_tick(now, 2);
+            ticks += 1;
+            if !app.find_busy() {
+                break;
+            }
+            assert!(find_state(&app).cursor < app.tree.nodes.len());
+            now += Duration::from_millis(1);
+        }
+        assert_eq!(ticks, app.tree.nodes.len().div_ceil(2));
+        assert_eq!(hit_names(&app), vec!["README.txt", "readme.md", "readme"]);
+    }
+
+    /// A broad query keeps at most FIND_CAP hits but still counts all matches.
+    #[test]
+    fn find_caps_hits_but_counts_all() {
+        let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        for i in 0..FIND_CAP + 5 {
+            file_under(&mut t, 0, &format!("hit{i}"), i as u64);
+        }
+        let mut app = App::new(t, true, false, false);
+        search(&mut app, "hit");
+        let f = find_state(&app);
+        assert_eq!(f.hits.len(), FIND_CAP);
+        assert_eq!(f.total, FIND_CAP + 5);
+        assert!(f.capped());
+    }
+
+    /// Entries a running scan adds after the pass are picked up by later ticks.
+    #[test]
+    fn find_picks_up_live_inserts() {
+        use crate::scan::NewNode;
+        let node = |name: &str, kind, dir_id| NewNode {
+            name: name.into(),
+            kind,
+            apparent: 10,
+            disk: 10,
+            dev: 1,
+            ino: 1,
+            hlink: false,
+            shared: false,
+            excluded: Excluded::No,
+            read_error: false,
+            dir_id,
+        };
+        let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
+        app.tree.apply(Batch {
+            parent_id: 0,
+            nodes: vec![
+                node("log", NodeKind::Dir, Some(1)),
+                node("a.log", NodeKind::File, None),
+            ],
+            error: None,
+        });
+        let now = search(&mut app, ".log");
+        assert_eq!(hit_names(&app), vec!["a.log"]);
+
+        app.tree.apply(Batch {
+            parent_id: 1,
+            nodes: vec![
+                node("b.log", NodeKind::File, None),
+                node("x", NodeKind::File, None),
+            ],
+            error: None,
+        });
+        assert!(app.find_busy(), "new nodes to look at");
+        app.find_tick(now + Duration::from_secs(1), usize::MAX);
+        assert_eq!(hit_names(&app), vec!["a.log", "b.log"]);
+        assert!(!app.find_busy());
+    }
+
+    /// Deleting a subtree drops its hits, and a new pass doesn't find the tombstones.
+    #[test]
+    fn find_drops_deleted_entries() {
+        let mut app = app_for_find();
+        search(&mut app, "readme");
+        app.tree.delete_subtree(idx_named(&app, "docs"));
+        app.prune_find();
+        assert_eq!(hit_names(&app), vec!["readme"]);
+        assert_eq!(find_state(&app).total, 1);
+        assert_eq!(find_state(&app).selected, Some(idx_named(&app, "readme")));
+
+        // Retype: the fresh pass walks over the tombstones but skips them.
+        app.on_key(KeyAction::FindBackspace);
+        app.on_key(KeyAction::FindChar('e'));
+        let t = Instant::now();
+        app.find_tick(t, usize::MAX);
+        app.find_tick(t + FIND_DEBOUNCE, usize::MAX);
+        assert_eq!(hit_names(&app), vec!["readme"]);
+    }
+
+    /// A rescan tears the old subtree down: its hits go; the rescanned directory stays.
+    #[test]
+    fn find_drops_rescanned_entries() {
+        let mut app = app_for_find();
+        search(&mut app, "d");
+        // docs/ aggregates its children (250), so it sorts first.
+        assert_eq!(
+            hit_names(&app),
+            vec!["docs", "README.txt", "readme.md", "readme"]
+        );
+        let docs = idx_named(&app, "docs");
+        app.tree.begin_refresh(docs, SCAN_ID_STRIDE);
+        app.prune_find();
+        assert_eq!(hit_names(&app), vec!["docs", "readme"]);
+        assert_eq!(find_state(&app).total, 2);
+    }
+
+    /// Past the cap the count can't be fixed up from the kept hits: the pass starts over.
+    #[test]
+    fn find_prune_restarts_a_capped_pass() {
+        let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        let dir = t.import_child(
+            t.root,
+            "dir".into(),
+            NodeKind::Dir,
+            0,
+            0,
+            1,
+            2,
+            false,
+            false,
+            Excluded::No,
+            false,
+        );
+        for i in 0..FIND_CAP + 5 {
+            file_under(&mut t, dir, &format!("hit{i}"), 1);
+        }
+        file_under(&mut t, 0, "hit-root", 1);
+        let mut app = App::new(t, true, false, false);
+        let now = search(&mut app, "hit");
+        assert!(find_state(&app).capped());
+
+        app.tree.delete_subtree(dir);
+        app.prune_find();
+        assert!(app.find_busy(), "restarted");
+        app.find_tick(now, usize::MAX);
+        assert_eq!(hit_names(&app), vec!["hit-root"]);
+        assert_eq!(find_state(&app).total, 1);
+    }
+
+    /// Enter moves the view to the hit's parent with the hit selected and closes the popup.
+    #[test]
+    fn find_enter_jumps_to_parent_with_match_selected() {
+        let mut app = app_for_find();
+        search(&mut app, "readme");
+        app.on_key(KeyAction::Down); // readme.md, in docs/
+        app.on_key(KeyAction::Enter);
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(app.cur, idx_named(&app, "docs"));
+        assert_eq!(app.selected, Some(idx_named(&app, "readme.md")));
+    }
+
+    /// Esc closes the popup and leaves the view untouched; Enter without hits does nothing.
+    #[test]
+    fn find_esc_leaves_view_unchanged() {
+        let mut app = app_for_find();
+        app.on_key(KeyAction::Down);
+        let (cur, sel) = (app.cur, app.selected);
+        search(&mut app, "zzz");
+        app.on_key(KeyAction::Enter);
+        assert!(matches!(app.modal, Modal::Find(_)), "nothing to jump to");
+        app.on_key(KeyAction::Cancel);
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!((app.cur, app.selected), (cur, sel));
+        assert!(!app.quit);
+    }
+
+    /// Ctrl-C (Quit) still quits while the popup is open; letters like `q` only type.
+    #[test]
+    fn find_quit_key_quits_but_q_types() {
+        let mut app = app_for_find();
+        app.on_key(KeyAction::Find);
+        app.on_key(KeyAction::FindChar('q'));
+        assert!(!app.quit);
+        assert_eq!(find_state(&app).query, "q");
+        app.on_key(KeyAction::Quit);
+        assert!(app.quit);
+    }
+
+    /// The highlight follows the selected entry when a re-sort moves it, and navigation
+    /// clamps at both ends.
+    #[test]
+    fn find_selection_tracks_identity_across_resort() {
+        let mut app = app_for_find();
+        let now = search(&mut app, "readme");
+        app.on_key(KeyAction::Down);
+        let md = idx_named(&app, "readme.md");
+        assert_eq!(find_state(&app).selected, Some(md));
+
+        // A bigger match appears (appended, as a scan would) and sorts to the top.
+        let root = app.tree.root;
+        file_under(&mut app.tree, root, "readme.huge", 9999);
+        app.find_tick(now + Duration::from_secs(1), usize::MAX);
+        assert_eq!(hit_names(&app)[0], "readme.huge");
+        assert_eq!(
+            find_state(&app).selected,
+            Some(md),
+            "same entry still selected"
+        );
+        assert_eq!(find_state(&app).selected_pos(), Some(2));
+
+        app.on_key(KeyAction::PageDown(99));
+        assert_eq!(find_state(&app).selected_pos(), Some(3));
+        app.on_key(KeyAction::PageUp(99));
+        assert_eq!(find_state(&app).selected_pos(), Some(0));
     }
 }

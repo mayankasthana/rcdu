@@ -85,6 +85,7 @@ rcdu -f old.json -o new.json    # re-read and rewrite a dump (recomputes totals/
 | `PgUp` / `PgDn`, `Ctrl-d` / `Ctrl-u` | page up / down |
 | `s` | toggle sort (size ↔ name) |
 | `/` | filter entries by name (type to filter live, Enter applies, Esc cancels) |
+| `f` | search the whole tree by name; `Enter` jumps to the selected match |
 | `a` | toggle apparent size ↔ on-disk usage |
 | `d` | delete selected entry (asks to confirm) |
 | `t` | show the largest files under the current directory |
@@ -117,6 +118,22 @@ title shows `N of M items` and the footer echoes the query with match counts, so
 never silently on. `Enter` applies it (navigation, delete, and open then operate only on the
 matches); `Esc` cancels and restores the previous selection. The filter applies to whichever
 directory you're viewing until cleared.
+
+### Searching the whole tree
+
+`/` only narrows the directory you're viewing. Press `f` to ask the other question: *where in
+this tree is anything called X?* Type part of a name (case-insensitive, the same matching as
+`/`); 100 ms after your last keystroke every entry in the tree is searched, and the matches are
+listed with their path relative to the scan root and their size, largest first, with the
+matched part highlighted. `↑`/`↓` and `PgUp`/`PgDn` move (letters all go to the query),
+`Enter` jumps to the directory containing the selected match with it highlighted, and `Esc`
+closes the popup without moving.
+
+The search runs in slices between frames, so the UI stays responsive even on trees with
+millions of entries; the title shows the match count and progress. While a scan or rescan is
+running, new matches appear as they are discovered, and entries you delete or rescan away
+drop out of the list. Very broad queries keep the first 10,000 matches and report
+`10,000+ matches`: refine the query to narrow them down.
 
 ### Largest files
 
